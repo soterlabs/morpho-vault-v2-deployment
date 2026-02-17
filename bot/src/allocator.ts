@@ -22,7 +22,7 @@ import { createPublicClient, createWalletClient, http, formatEther, parseEther, 
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 import 'dotenv/config';
-import { computeAllocationActions } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS } from './allocation-logic.js';
 
 // ============ CONFIGURATION ============
 
@@ -533,22 +533,61 @@ async function main() {
 
   log(`Executing ${actions.length} allocation actions:`);
 
-  for (const { market, action, amount } of actions) {
-    log(`  ${action} ${formatEther(amount)} USDS to ${market.name}`);
+  const relativeCapWad = bpsToWad(config.targetPerMarketPercent);
 
+  for (const { market, action, amount } of actions) {
     if (config.dryRun) {
-      log('  [DRY RUN] Skipping transaction');
+      log(`  ${action} ${formatEther(amount)} USDS to ${market.name} [DRY RUN]`);
       continue;
     }
 
     try {
       const functionName = action === 'allocate' ? 'allocate' : 'deallocate';
+      let execAmount = amount;
+
+      if (action === 'allocate') {
+        // Re-read fresh state right before execution to avoid RelativeCapExceeded.
+        // The vault checks: caps[id].allocation <= totalAssets * relativeCap / WAD
+        // Interest accrues between our initial read and execution, so the pre-computed
+        // amount may overshoot the cap. Instead, we replicate the vault's exact math
+        // using fresh on-chain values: amount = capLimit - currentExpectedSupplyAssets.
+        const marketId = computeMarketId(market);
+        const [freshTotalAssets, freshExpectedSupplyAssets] = await Promise.all([
+          publicClient.readContract({
+            address: config.vaultAddress,
+            abi: vaultAbi,
+            functionName: 'totalAssets',
+          }),
+          publicClient.readContract({
+            address: config.adapterAddress,
+            abi: adapterAbi,
+            functionName: 'expectedSupplyAssets',
+            args: [marketId],
+          }),
+        ]);
+
+        const capLimit = computeCapLimit(freshTotalAssets, relativeCapWad);
+        const headroom = capLimit * CAP_HEADROOM_BPS / 10000n;
+        const effectiveCap = capLimit - headroom;
+        execAmount = effectiveCap > freshExpectedSupplyAssets
+          ? effectiveCap - freshExpectedSupplyAssets
+          : 0n;
+
+        if (execAmount === 0n) {
+          log(`  ${market.name}: already at cap (${formatEther(freshExpectedSupplyAssets)} >= ${formatEther(effectiveCap)}), skipping`);
+          continue;
+        }
+
+        log(`  allocate ${formatEther(execAmount)} USDS to ${market.name} (cap: ${formatEther(capLimit)}, headroom: ${formatEther(headroom)}, current: ${formatEther(freshExpectedSupplyAssets)})`);
+      } else {
+        log(`  deallocate ${formatEther(execAmount)} USDS from ${market.name}`);
+      }
 
       // Encode the vault call data
       const callData = encodeFunctionData({
         abi: vaultAbi,
         functionName,
-        args: [config.adapterAddress, market.encodedParams!, amount],
+        args: [config.adapterAddress, market.encodedParams!, execAmount],
       });
 
       // Execute through Safe multisig

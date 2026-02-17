@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeAllocationActions, type AllocationInput } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, type AllocationInput } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
 // Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each)
@@ -13,6 +13,79 @@ function input(overrides: Partial<AllocationInput> & Pick<AllocationInput, 'tota
 }
 
 const eth = parseEther;
+
+describe('computeCapLimit', () => {
+  it('replicates vault mulDivDown(totalAssets, relativeCap, WAD)', () => {
+    // 5% of 1000 USDS = 50 USDS
+    expect(computeCapLimit(eth('1000'), bpsToWad(500))).toBe(eth('50'));
+  });
+
+  it('handles 100% cap', () => {
+    expect(computeCapLimit(eth('1000'), bpsToWad(10000))).toBe(eth('1000'));
+  });
+
+  it('truncates fractional wei (integer division)', () => {
+    // 5% of 1 wei = 0.05 wei → truncates to 0
+    expect(computeCapLimit(1n, bpsToWad(500))).toBe(0n);
+  });
+
+  it('handles large totalAssets without overflow', () => {
+    // 5% of 100M USDS
+    expect(computeCapLimit(eth('100000000'), bpsToWad(500))).toBe(eth('5000000'));
+  });
+
+  it('handles zero totalAssets', () => {
+    expect(computeCapLimit(0n, bpsToWad(500))).toBe(0n);
+  });
+});
+
+describe('bpsToWad', () => {
+  it('converts 500 bps (5%) to 5e16', () => {
+    expect(bpsToWad(500)).toBe(50000000000000000n);
+  });
+
+  it('converts 10000 bps (100%) to 1e18', () => {
+    expect(bpsToWad(10000)).toBe(1000000000000000000n);
+  });
+
+  it('converts 1 bps (0.01%) to 1e14', () => {
+    expect(bpsToWad(1)).toBe(100000000000000n);
+  });
+
+  it('converts 0 bps to 0', () => {
+    expect(bpsToWad(0)).toBe(0n);
+  });
+});
+
+describe('CAP_HEADROOM_BPS', () => {
+  it('is 1 bps', () => {
+    expect(CAP_HEADROOM_BPS).toBe(1n);
+  });
+
+  it('applied to cap limit gives correct effective cap', () => {
+    // Simulates what allocator.ts does:
+    // effectiveCap = capLimit - capLimit * CAP_HEADROOM_BPS / 10000
+    const capLimit = computeCapLimit(eth('20000000'), bpsToWad(500)); // 5% of $20M = $1M
+    const headroom = capLimit * CAP_HEADROOM_BPS / 10000n;
+    const effectiveCap = capLimit - headroom;
+
+    expect(capLimit).toBe(eth('1000000'));
+    expect(headroom).toBe(eth('100')); // $100 headroom on $1M cap
+    expect(effectiveCap).toBe(eth('999900'));
+  });
+
+  it('headroom covers interest accrual at max rate over 10 minutes', () => {
+    // Max rate = 200% APR, 10 min delay, $1M position
+    // interest = $1M * 2.0 * 600 / 31_557_600 ≈ $38
+    // gap = 0.8 * $38 ≈ $30 (80% because totalAssets grows slower than per-market interest)
+    // headroom = $100 >> $30
+    const capLimit = computeCapLimit(eth('20000000'), bpsToWad(500));
+    const headroom = capLimit * CAP_HEADROOM_BPS / 10000n;
+    const interestGap = eth('1000000') * 2n * 600n * 8n / (31_557_600n * 10n);
+
+    expect(headroom).toBeGreaterThan(interestGap);
+  });
+});
 
 describe('computeAllocationActions', () => {
   // ============================================================
@@ -160,7 +233,7 @@ describe('computeAllocationActions', () => {
       expect(result.skipped).toBe(false);
       for (const action of result.actions) {
         expect(action.action).toBe('deallocate');
-        expect(action.amount).toBe(eth('25')); // 75 - 50 = 25 excess per market
+        expect(action.amount).toBe(eth('25')); // 75 - 50 = 25 excess
       }
     });
   });
@@ -195,7 +268,7 @@ describe('computeAllocationActions', () => {
   // The real-world scenario from our deployment
   // ============================================================
   describe('tiny vault (1 USDS dead deposit)', () => {
-    it('allocates 0.05 USDS per market', () => {
+    it('allocates 5% per market', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1'),
         adapterAssets: 0n,
@@ -239,6 +312,40 @@ describe('computeAllocationActions', () => {
       }));
 
       expect(result.skipped).toBe(true);
+    });
+  });
+
+  // ============================================================
+  // Case 8: Approximate amounts — caller re-reads fresh state
+  // The allocation amounts from computeAllocationActions are approximate.
+  // The caller (allocator.ts) re-reads fresh totalAssets and
+  // expectedSupplyAssets before each allocation and uses
+  // computeCapLimit() for the exact on-chain amount.
+  // ============================================================
+  describe('approximate allocations (exact amounts computed by caller)', () => {
+    it('returns the raw deficit as allocation amount', () => {
+      const result = computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        adapterAssets: 0n,
+        perMarketAssets: [0n],
+        targetAllocatedPercent: 500,
+        targetPerMarketPercent: 500,
+      }));
+
+      // Raw deficit — the caller will compute exact amount via computeCapLimit()
+      expect(result.actions[0].amount).toBe(eth('50'));
+    });
+
+    it('deallocate amounts are exact (no cap check needed)', () => {
+      const result = computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        adapterAssets: eth('300'),
+        perMarketAssets: [eth('75')],
+        targetAllocatedPercent: 500,
+        targetPerMarketPercent: 500,
+      }));
+
+      expect(result.actions[0].amount).toBe(eth('25'));
     });
   });
 

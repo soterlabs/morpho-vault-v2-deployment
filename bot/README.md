@@ -139,6 +139,24 @@ After:  [5%, 5%, 5%, 5%]  (20% total)
 ### Case 6: Interest accrual
 Markets accrue interest over time, causing small deviations. As long as the total deviation stays below 1%, no rebalancing is triggered.
 
+### Fresh state reads + headroom (1 bps)
+The vault's relative cap check uses `mulDivDown(totalAssets, relativeCap, WAD)` to compute the maximum allowed allocation. Interest accrues between the bot's RPC read and tx execution, which can cause the adapter's `expectedSupplyAssets` to overshoot the cap.
+
+The 80% idle portion doesn't earn interest, so `totalAssets` grows slower than any individual market's `expectedSupplyAssets`. This means even with fresh reads, interest accrual over a few blocks can cause `RelativeCapExceeded`.
+
+To prevent this, the bot:
+1. Re-reads `vault.totalAssets()` and `adapter.expectedSupplyAssets(marketId)` fresh right before each allocation
+2. Subtracts a 1 bps (0.01%) headroom from the cap limit
+
+```
+capLimit     = totalAssets * relativeCap / WAD   // replicates vault's mulDivDown
+headroom     = capLimit * 1 / 10000              // 1 bps of cap limit
+effectiveCap = capLimit - headroom
+amount       = effectiveCap - expectedSupplyAssets
+```
+
+The headroom covers ~10 minutes of delay at 200% APR max rate. On a $20M vault (5% cap = $1M per market), the headroom is $100 per market — negligible for the strategy. Deallocations don't need this treatment since they have no cap check.
+
 ## Testing
 
 ```bash

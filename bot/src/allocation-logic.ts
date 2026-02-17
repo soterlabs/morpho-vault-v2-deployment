@@ -4,6 +4,15 @@
  * Extracted from allocator.ts so it can be unit-tested without RPC or Safe dependencies.
  */
 
+const WAD = 1_000_000_000_000_000_000n; // 1e18
+
+/**
+ * Headroom subtracted from the cap limit before allocating.
+ * Covers interest accrual between the fresh RPC read and tx execution.
+ * 1 bps (0.01%) of cap limit — covers ~10 min delay at 200% APR max rate.
+ */
+export const CAP_HEADROOM_BPS = 1n;
+
 export interface AllocationAction {
   marketIndex: number;
   action: 'allocate' | 'deallocate';
@@ -26,7 +35,30 @@ export interface AllocationResult {
 }
 
 /**
+ * Replicate the vault's `mulDivDown(totalAssets, relativeCap, WAD)` exactly.
+ * Returns the maximum allocation allowed by a relative cap for a given totalAssets.
+ *
+ * @param totalAssets - The vault's totalAssets (matches firstTotalAssets in the same block)
+ * @param relativeCapWad - The relative cap in WAD (e.g. 5e16 for 5%)
+ */
+export function computeCapLimit(totalAssets: bigint, relativeCapWad: bigint): bigint {
+  return totalAssets * relativeCapWad / WAD;
+}
+
+/**
+ * Convert a basis-points cap value to WAD for use with computeCapLimit.
+ * E.g. 500 bps (5%) → 5e16
+ */
+export function bpsToWad(bps: number): bigint {
+  return BigInt(bps) * WAD / 10000n;
+}
+
+/**
  * Compute the allocation/deallocation actions needed to reach target per-market allocations.
+ *
+ * For allocations, the returned amounts are approximate (based on the initial state read).
+ * The caller should re-read fresh state before each allocation and recompute the exact
+ * amount using computeCapLimit() to avoid RelativeCapExceeded from interest accrual.
  *
  * Cases handled:
  * 1. Within threshold  — no actions (deviation < rebalanceThresholdBps)
