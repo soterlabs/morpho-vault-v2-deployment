@@ -325,6 +325,18 @@ async function executeSafeTransaction(
   sigBytes[64] += 4;
   const adjustedSig = bytesToHex(sigBytes);
 
+  // Estimate gas with a buffer to account for state changes between estimation and execution.
+  // The stUSDS market is highly active (~14M TVL), so adapter.realAssets() gas cost varies
+  // depending on market state at execution time vs estimation time.
+  const estimatedGas = await publicClient.estimateContractGas({
+    account,
+    address: safeAddress,
+    abi: safeAbi,
+    functionName: 'execTransaction',
+    args: [to, 0n, data, 0, 0n, 0n, 0n, ZERO_ADDRESS, ZERO_ADDRESS, adjustedSig],
+  });
+  const gasWithBuffer = estimatedGas * 150n / 100n; // 50% buffer
+
   // Execute through Safe (bot's EOA pays gas, Safe executes the inner call)
   const hash = await walletClient.writeContract({
     account,
@@ -333,6 +345,7 @@ async function executeSafeTransaction(
     abi: safeAbi,
     functionName: 'execTransaction',
     args: [to, 0n, data, 0, 0n, 0n, 0n, ZERO_ADDRESS, ZERO_ADDRESS, adjustedSig],
+    gas: gasWithBuffer,
   });
 
   return hash;
