@@ -59,6 +59,11 @@ library Constants {
     uint256 internal constant DECIMALS_WSTETH = 18;
     uint256 internal constant DECIMALS_WETH = 18;
 
+    // ============ ROLE ADDRESSES ============
+
+    address internal constant SKY_MONEY_CURATOR = 0x3F32bC09d41eE699844F8296e806417D6bf61Bba;
+    address internal constant ALLOCATOR_FLAGSHIP = 0xE4d5F54CE1830d5eCC49751021F306CFE7a52649;
+
     // ============ DEPLOYMENT PARAMS ============
 
     uint256 internal constant INITIAL_DEAD_DEPOSIT = 1e18; // 1 USDS

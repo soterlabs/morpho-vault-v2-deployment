@@ -30,8 +30,8 @@ contract CreateVault is Script {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
-        string memory vaultName = vm.envOr("VAULT_NAME", string("sky.money USDS Flagship"));
-        string memory vaultSymbol = vm.envOr("VAULT_SYMBOL", string("skyMoneyUsdsFlagship"));
+        string memory vaultName = "sky.money USDS Flagship";
+        string memory vaultSymbol = "skyMoneyUsdsFlagship";
 
         console.log("=== Step 1/5: Create Vault ===");
         console.log("Deployer:", deployer);

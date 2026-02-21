@@ -29,9 +29,6 @@ import {DeployHelpers} from "../../src/lib/DeployHelpers.sol";
  *   ORACLE_CBBTC - From script 2
  *   ORACLE_WSTETH - From script 3
  *   ORACLE_WETH - From script 4
- *
- * Optional environment variables:
- *   OWNER, CURATOR, ALLOCATOR, SENTINEL - Final role addresses
  */
 contract ConfigureVault is DeployHelpers {
     // Allocation caps
@@ -52,11 +49,11 @@ contract ConfigureVault is DeployHelpers {
         address oracleWstEth = vm.envAddress("ORACLE_WSTETH");
         address oracleWeth = vm.envAddress("ORACLE_WETH");
 
-        // Optional: final role addresses
-        address finalOwner = vm.envOr("OWNER", deployer);
-        address finalCurator = vm.envOr("CURATOR", deployer);
-        address finalAllocator = vm.envOr("ALLOCATOR", deployer);
-        address sentinel = vm.envOr("SENTINEL", address(0));
+        // Final role addresses
+        address finalOwner = Constants.SKY_MONEY_CURATOR;
+        address finalCurator = Constants.SKY_MONEY_CURATOR;
+        address finalAllocator = Constants.ALLOCATOR_FLAGSHIP;
+        address sentinel = Constants.SKY_MONEY_CURATOR;
 
         console.log("=== Step 5/5: Configure Vault ===");
         console.log("Vault:", vaultAddress);

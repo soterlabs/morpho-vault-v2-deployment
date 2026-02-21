@@ -35,13 +35,13 @@ contract DeployUsdsRiskCapital is DeployHelpers, StdCheats {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
-        address finalOwner = vm.envOr("OWNER", deployer);
-        address finalCurator = vm.envOr("CURATOR", deployer);
-        address finalAllocator = vm.envOr("ALLOCATOR", deployer);
-        address sentinel = vm.envOr("SENTINEL", address(0));
+        address finalOwner = Constants.SKY_MONEY_CURATOR;
+        address finalCurator = Constants.SKY_MONEY_CURATOR;
+        address finalAllocator = Constants.SKY_MONEY_CURATOR;
+        address sentinel = Constants.SKY_MONEY_CURATOR;
 
-        string memory vaultName = vm.envOr("VAULT_NAME", string("sky.money USDS Risk Capital"));
-        string memory vaultSymbol = vm.envOr("VAULT_SYMBOL", string("skyMoneyUsdsRiskCapital"));
+        string memory vaultName = "sky.money USDS Risk Capital";
+        string memory vaultSymbol = "skyMoneyUsdsRiskCapital";
 
         vm.startBroadcast(deployerPrivateKey);
 
@@ -137,23 +137,30 @@ contract DeployUsdsRiskCapital is DeployHelpers, StdCheats {
         console.log("Max Rate set to 200% APR");
     }
 
+    /// @dev Dead deposits bootstrap the market to prevent share manipulation attacks and seed initial utilization.
+    ///      1. Deposit 1 USDS via the vault (auto-allocated to market via liquidity adapter) → market supply = 1 USDS
+    ///      2. Supply 1 USDS directly to the Morpho market → market supply = 2 USDS
+    ///      3. Supply 2.1 stUSDS as collateral to the market
+    ///      4. Borrow 1.8 USDS from the market → utilization = 1.8 / 2 = 90%
     function _setupDeadDeposits(VaultV2 vault, IMorpho morpho, MarketParams memory params, address deployer) internal {
-        // A. Deposit into Vault
+        // A. Deposit 1 USDS into the vault (sent to 0xdEaD to make shares unrecoverable).
+        //    Since the liquidity adapter is set, this deposit is auto-allocated to the Morpho market.
         IERC20(Constants.USDS).approve(address(vault), Constants.INITIAL_DEAD_DEPOSIT);
         vault.deposit(Constants.INITIAL_DEAD_DEPOSIT, address(0xdEaD));
         console.log("Dead deposit to vault executed.");
 
-        // B. Supply directly to Morpho Market
+        // B. Supply 1 USDS directly to the Morpho market (also to 0xdEaD).
+        //    Combined with step A, total market supply = 2 USDS.
         IERC20(Constants.USDS).approve(Constants.MORPHO_BLUE, Constants.INITIAL_DEAD_DEPOSIT);
         morpho.supply(params, Constants.INITIAL_DEAD_DEPOSIT, 0, address(0xdEaD), bytes(""));
         console.log("Dead supply to morpho market executed.");
 
-        // C. Supply stUSDS collateral
+        // C. Supply 2.1 stUSDS as collateral to enable borrowing.
         IERC20(Constants.ST_USDS).approve(Constants.MORPHO_BLUE, INITIAL_DEAD_COLLATERAL);
         morpho.supplyCollateral(params, INITIAL_DEAD_COLLATERAL, deployer, bytes(""));
         console.log("Dead collateral supply to morpho market executed.");
 
-        // D. Borrow USDS for 90% utilization
+        // D. Borrow 1.8 USDS to reach 90% utilization (1.8 / 2 = 90%).
         morpho.borrow(params, DEAD_BORROW_AMOUNT, 0, deployer, deployer);
         console.log("Dead borrow executed for 90% utilization.");
     }

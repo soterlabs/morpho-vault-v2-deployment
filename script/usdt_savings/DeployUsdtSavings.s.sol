@@ -37,13 +37,13 @@ contract DeployUsdtSavings is DeployHelpers, StdCheats {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
-        address finalOwner = vm.envOr("OWNER", deployer);
-        address finalCurator = vm.envOr("CURATOR", deployer);
-        address finalAllocator = vm.envOr("ALLOCATOR", deployer);
-        address sentinel = vm.envOr("SENTINEL", address(0));
+        address finalOwner = Constants.SKY_MONEY_CURATOR;
+        address finalCurator = Constants.SKY_MONEY_CURATOR;
+        address finalAllocator = Constants.SKY_MONEY_CURATOR;
+        address sentinel = Constants.SKY_MONEY_CURATOR;
 
-        string memory vaultName = vm.envOr("VAULT_NAME", string("sky.money USDT Savings"));
-        string memory vaultSymbol = vm.envOr("VAULT_SYMBOL", string("skyMoneyUsdtSavings"));
+        string memory vaultName = "sky.money USDT Savings";
+        string memory vaultSymbol = "skyMoneyUsdtSavings";
 
         vm.startBroadcast(deployerPrivateKey);
 
