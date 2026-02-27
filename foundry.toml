@@ -6,5 +6,6 @@ via_ir = true
 optimizer = true
 optimizer_runs = 100000
 evm_version = "cancun"
+remappings = ["sparklend-advanced/=lib/sparklend-advanced/src/"]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

@@ -13,17 +13,19 @@ import {VaultV2Factory} from "vault-v2/VaultV2Factory.sol";
 import {IMorphoMarketV1AdapterV2} from "vault-v2/adapters/interfaces/IMorphoMarketV1AdapterV2.sol";
 
 import {Constants} from "../../src/lib/Constants.sol";
+import {CappedChainlinkFeed} from "../../src/CappedChainlinkFeed.sol";
 import {DeployHelpers, IMorphoChainlinkOracleV2Factory, IMorphoMarketV1AdapterV2Factory} from "../../src/lib/DeployHelpers.sol";
 
 /**
  * @title DeployUsdtSavings
- * @notice Deploys USDT Savings Vault V2 and connects it to the stUSDS/USDT Morpho Market (96.5% LLTV)
- * @dev Single-market vault with liquidity adapter. Oracle uses stUSDS ERC4626 + USDS/USD and USDT/USD Chainlink feeds.
+ * @notice Deploys USDT Savings Vault V2 and connects it to the sUSDS/USDT Morpho Market (96.5% LLTV)
+ * @dev Single-market vault with liquidity adapter. Oracle uses sUSDS ERC4626 + USDS/USD and capped USDT/USD Chainlink feeds.
+ *      USDT/USD feed is capped at $1 to prevent upward depeg from undervaluing collateral.
  *      Higher LLTV (96.5%) compared to Risk Capital vaults (86%).
  */
 contract DeployUsdtSavings is DeployHelpers, StdCheats {
     using SafeERC20 for IERC20;
-    uint256 constant INITIAL_DEAD_COLLATERAL = 21e17; // 2.1 stUSDS (18 dec)
+    uint256 constant INITIAL_DEAD_COLLATERAL = 21e17; // 2.1 sUSDS (18 dec)
     uint256 constant DEAD_BORROW_AMOUNT = 18e5; // 1.8 USDT for 90% utilization (6 dec)
 
     struct DeploymentResult {
@@ -47,11 +49,15 @@ contract DeployUsdtSavings is DeployHelpers, StdCheats {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        // Step 1: Create Oracle (stUSDS/USDT using ERC4626 + Chainlink feeds)
+        // Step 1a: Deploy capped USDT/USD feed (cap at $1 = 1e8 in Chainlink 8-decimal format)
+        CappedChainlinkFeed cappedUsdtFeed = new CappedChainlinkFeed(Constants.CHAINLINK_USDT_USD, 1e8);
+        console.log("Capped USDT/USD feed deployed at:", address(cappedUsdtFeed));
+
+        // Step 1b: Create Oracle (sUSDS/USDT using ERC4626 + Chainlink feeds)
         bytes32 oracleSalt = keccak256(abi.encodePacked(block.timestamp, "OracleUsdtSavings"));
         result.oracle = IMorphoChainlinkOracleV2Factory(Constants.ORACLE_FACTORY).createMorphoChainlinkOracleV2(
-            Constants.ST_USDS, 1e18, Constants.CHAINLINK_USDS_USD, address(0), Constants.DECIMALS_STUSDS,
-            address(0), 1, Constants.CHAINLINK_USDT_USD, address(0), Constants.DECIMALS_USDT,
+            Constants.S_USDS, 1e18, Constants.CHAINLINK_USDS_USD, address(0), Constants.DECIMALS_SUSDS,
+            address(0), 1, address(cappedUsdtFeed), address(0), Constants.DECIMALS_USDT,
             oracleSalt
         );
         console.log("Oracle deployed at:", result.oracle);
@@ -60,7 +66,7 @@ contract DeployUsdtSavings is DeployHelpers, StdCheats {
         IMorpho morpho = IMorpho(Constants.MORPHO_BLUE);
         MarketParams memory params = MarketParams({
             loanToken: Constants.USDT,
-            collateralToken: Constants.ST_USDS,
+            collateralToken: Constants.S_USDS,
             oracle: result.oracle,
             irm: Constants.IRM_ADAPTIVE,
             lltv: Constants.LLTV_SAVINGS
@@ -125,7 +131,7 @@ contract DeployUsdtSavings is DeployHelpers, StdCheats {
         _submitAndExecute(address(vault), abi.encodeWithSelector(IVaultV2.increaseAbsoluteCap.selector, marketIdData, type(uint128).max));
         _submitAndExecute(address(vault), abi.encodeWithSelector(IVaultV2.increaseRelativeCap.selector, marketIdData, 1e18));
 
-        bytes memory collateralIdData = abi.encode("collateralToken", Constants.ST_USDS);
+        bytes memory collateralIdData = abi.encode("collateralToken", Constants.S_USDS);
         _submitAndExecute(address(vault), abi.encodeWithSelector(IVaultV2.increaseAbsoluteCap.selector, collateralIdData, type(uint128).max));
         _submitAndExecute(address(vault), abi.encodeWithSelector(IVaultV2.increaseRelativeCap.selector, collateralIdData, 1e18));
 
@@ -146,8 +152,8 @@ contract DeployUsdtSavings is DeployHelpers, StdCheats {
         morpho.supply(params, Constants.INITIAL_DEAD_DEPOSIT_6DEC, 0, address(0xdEaD), bytes(""));
         console.log("Dead supply to morpho market executed.");
 
-        // C. Supply stUSDS collateral
-        IERC20(Constants.ST_USDS).forceApprove(Constants.MORPHO_BLUE, INITIAL_DEAD_COLLATERAL);
+        // C. Supply sUSDS collateral
+        IERC20(Constants.S_USDS).forceApprove(Constants.MORPHO_BLUE, INITIAL_DEAD_COLLATERAL);
         morpho.supplyCollateral(params, INITIAL_DEAD_COLLATERAL, deployer, bytes(""));
         console.log("Dead collateral supply to morpho market executed.");
 

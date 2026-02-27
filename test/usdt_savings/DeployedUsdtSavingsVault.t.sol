@@ -6,6 +6,7 @@ import {IMorpho, MarketParams, Id, Market} from "metamorpho-v1.1-morpho-blue/src
 import {IMorphoMarketV1AdapterV2} from "vault-v2/adapters/interfaces/IMorphoMarketV1AdapterV2.sol";
 
 import {Constants} from "../../src/lib/Constants.sol";
+import {CappedChainlinkFeed} from "../../src/CappedChainlinkFeed.sol";
 import {IMorphoChainlinkOracleV2} from "../../src/lib/DeployHelpers.sol";
 import {BaseDeployedVaultTest} from "../base/BaseDeployedVaultTest.sol";
 
@@ -88,7 +89,7 @@ contract DeployedUsdtSavingsVaultTest is BaseDeployedVaultTest {
         IMorphoChainlinkOracleV2 oracle = IMorphoChainlinkOracleV2(params.oracle);
         uint256 price = oracle.price();
 
-        // Scale = 10^(36 + 6 - 18) = 10^24. stUSDS ~$1.05 USDT
+        // Scale = 10^(36 + 6 - 18) = 10^24. sUSDS ~$1.05 USDT
         uint256 expectedScale = 1e24;
         assertGt(price, expectedScale * 100 / 100, "Price should be >= 1.00 * scale");
         assertLt(price, expectedScale * 120 / 100, "Price should be < 1.20 * scale");
@@ -103,12 +104,17 @@ contract DeployedUsdtSavingsVaultTest is BaseDeployedVaultTest {
 
         IMorphoChainlinkOracleV2 oracle = IMorphoChainlinkOracleV2(params.oracle);
 
-        assertEq(oracle.BASE_VAULT(), Constants.ST_USDS, "Base vault should be stUSDS");
+        assertEq(oracle.BASE_VAULT(), Constants.S_USDS, "Base vault should be sUSDS");
         assertEq(oracle.BASE_VAULT_CONVERSION_SAMPLE(), 1e18, "Base vault conversion sample should be 1e18");
         assertEq(oracle.BASE_FEED_1(), Constants.CHAINLINK_USDS_USD, "Base feed 1 should be USDS/USD");
         assertEq(oracle.BASE_FEED_2(), address(0), "Base feed 2 should be zero");
         assertEq(oracle.QUOTE_VAULT(), address(0), "Quote vault should be zero");
-        assertEq(oracle.QUOTE_FEED_1(), Constants.CHAINLINK_USDT_USD, "Quote feed 1 should be USDT/USD");
+        // Quote feed 1 is a capped USDT/USD feed (not the raw Chainlink feed)
+        address quoteFeed1 = oracle.QUOTE_FEED_1();
+        assertTrue(quoteFeed1 != address(0), "Quote feed 1 should not be zero");
+        CappedChainlinkFeed cappedFeed = CappedChainlinkFeed(quoteFeed1);
+        assertEq(address(cappedFeed.source()), Constants.CHAINLINK_USDT_USD, "Capped feed underlying should be USDT/USD");
+        assertEq(cappedFeed.maxPrice(), 1e8, "Capped feed max price should be $1 (1e8)");
         assertEq(oracle.QUOTE_FEED_2(), address(0), "Quote feed 2 should be zero");
     }
 
@@ -119,7 +125,7 @@ contract DeployedUsdtSavingsVaultTest is BaseDeployedVaultTest {
         MarketParams memory params = abi.decode(liquidityData, (MarketParams));
 
         assertEq(params.loanToken, Constants.USDT, "Loan token should be USDT");
-        assertEq(params.collateralToken, Constants.ST_USDS, "Collateral should be stUSDS");
+        assertEq(params.collateralToken, Constants.S_USDS, "Collateral should be sUSDS");
         assertEq(params.irm, Constants.IRM_ADAPTIVE, "IRM should be adaptive");
         assertEq(params.lltv, Constants.LLTV_SAVINGS, "LLTV should be 96.5%");
         assertTrue(params.oracle != address(0), "Oracle should not be zero");

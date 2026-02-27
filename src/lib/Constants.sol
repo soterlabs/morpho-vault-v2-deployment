@@ -15,6 +15,7 @@ library Constants {
 
     // Collateral Tokens
     address internal constant ST_USDS = 0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9;
+    address internal constant S_USDS = 0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD;
     address internal constant CBBTC = 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf;
     address internal constant WSTETH = 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0;
     address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
@@ -55,6 +56,7 @@ library Constants {
     uint256 internal constant DECIMALS_USDT = 6;
     uint256 internal constant DECIMALS_USDS = 18;
     uint256 internal constant DECIMALS_STUSDS = 18;
+    uint256 internal constant DECIMALS_SUSDS = 18;
     uint256 internal constant DECIMALS_CBBTC = 8;
     uint256 internal constant DECIMALS_WSTETH = 18;
     uint256 internal constant DECIMALS_WETH = 18;
