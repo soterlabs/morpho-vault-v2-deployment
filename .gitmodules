@@ -7,6 +7,6 @@
 [submodule "lib/vault-v2"]
 	path = lib/vault-v2
 	url = https://github.com/morpho-org/vault-v2
-[submodule "lib/sparklend-advanced"]
-	path = lib/sparklend-advanced
-	url = https://github.com/sparkdotfi/sparklend-advanced
+[submodule "lib/capped-oracle-feed"]
+	path = lib/capped-oracle-feed
+	url = https://github.com/soterlabs/capped-oracle-feed

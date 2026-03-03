@@ -6,6 +6,8 @@ via_ir = true
 optimizer = true
 optimizer_runs = 100000
 evm_version = "cancun"
-remappings = ["sparklend-advanced/=lib/sparklend-advanced/src/"]
+remappings = ["capped-oracle-feed/=lib/capped-oracle-feed/src/"]
+
+fs_permissions = [{ access = "read-write", path = "out/migration" }]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

@@ -10,11 +10,5 @@
       "name": "v5.5.0",
       "rev": "fcbae5394ae8ad52d8e580a3477db99814b9d565"
     }
-  },
-  "lib/sparklend-advanced": {
-    "tag": {
-      "name": "v1.6.0",
-      "rev": "e2ba58d05a10cf403092f1ad125f70a3fdcc85ee"
-    }
   }
 }
