@@ -52,6 +52,13 @@ contract MigrationIntegrationTest is Test {
         vm.setEnv("PRIVATE_KEY", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
         deployer = vm.addr(vm.envUint("PRIVATE_KEY"));
 
+        // Warp to old market's lastUpdate + 1 BEFORE deploying the vault to avoid stale fork
+        // IRM overflow. The adaptive IRM overflows computing exp(speed * elapsed) for large elapsed.
+        // Must be done before vault deployment so the vault's internal timestamps are consistent.
+        Id oldMarketId = Id.wrap(Constants.EXISTING_SUSDS_USDT_MARKET_ID);
+        Market memory marketState = IMorpho(Constants.MORPHO_BLUE).market(oldMarketId);
+        vm.warp(marketState.lastUpdate + 1);
+
         // Step 1: Deploy the initial USDT Savings vault
         deal(Constants.USDT, deployer, 100e6);
         deal(Constants.S_USDS, deployer, 10e18);
@@ -86,12 +93,6 @@ contract MigrationIntegrationTest is Test {
         vm.createDir("out/migration", true);
         GenerateSafePayload phase2Script = new GenerateSafePayload();
         phase2Script.run();
-
-        // Warp to old market's lastUpdate + 1 to avoid stale fork IRM overflow.
-        // Without this, the adaptive IRM overflows computing exp(speed * elapsed) for large elapsed.
-        Id oldMarketId = Id.wrap(Constants.EXISTING_SUSDS_USDT_MARKET_ID);
-        Market memory marketState = IMorpho(Constants.MORPHO_BLUE).market(oldMarketId);
-        vm.warp(marketState.lastUpdate + 1);
     }
 
     // ============ FULL MIGRATION FLOW ============
@@ -110,21 +111,17 @@ contract MigrationIntegrationTest is Test {
         assertGt(shares, 0, "User should receive shares");
         console.log("User deposited 100 USDT, received shares:", shares);
 
-        // === ROUND 1: Execute round1_submit.json ===
-        _executeJsonAsRole("out/migration/round1_submit.json", 2, curator);
-        console.log("Round 1: Executed submit txs from JSON");
+        // === ROUND 1: Submit cap increases (3-day timelock) ===
+        _executeJsonAsRole("out/migration/round1_submit_caps.json", 2, curator);
+        console.log("Round 1: Submitted cap increases");
 
         // === TIMELOCK: Wait 3 days ===
         vm.warp(block.timestamp + Constants.TIMELOCK_LOW + 1);
         console.log("Warped 3 days for timelock");
 
-        // === ROUND 2a: Execute round2_execute_caps.json ===
-        _executeJsonAsRole("out/migration/round2_execute_caps.json", 3, curator);
-        console.log("Round 2a: Executed caps + liquidity adapter change from JSON");
-
-        // Verify liquidity adapter now points to new market
-        MarketParams memory currentParams = abi.decode(vault.liquidityData(), (MarketParams));
-        assertEq(currentParams.oracle, migrationResult.oracle, "Liquidity adapter should use new oracle");
+        // === ROUND 2: Execute cap increases ===
+        _executeJsonAsRole("out/migration/round2_execute_caps.json", 2, curator);
+        console.log("Round 2: Executed cap increases");
 
         // Verify new market caps are set
         bytes memory newMarketIdData = abi.encode("this/marketParams", adapter, newParams);
@@ -132,10 +129,18 @@ contract MigrationIntegrationTest is Test {
         assertEq(vault.absoluteCap(newMarketCapId), type(uint128).max, "New market absolute cap should be max");
         assertEq(vault.relativeCap(newMarketCapId), 1e18, "New market relative cap should be 100%");
 
-        // === ROUND 2b: Execute round2_reallocate.json (with patched amounts) ===
+        // === ROUND 3: Switch liquidity adapter ===
+        _executeJsonAsRole("out/migration/round3_switch_adapter.json", 1, curator);
+        console.log("Round 3: Switched liquidity adapter to new market");
+
+        // Verify liquidity adapter now points to new market
+        MarketParams memory currentParams = abi.decode(vault.liquidityData(), (MarketParams));
+        assertEq(currentParams.oracle, migrationResult.oracle, "Liquidity adapter should use new oracle");
+
+        // === ROUND 4: Reallocate (with patched amounts) ===
         // The JSON has placeholder amount=0. We patch with actual amounts before executing.
-        _executeReallocateJsonWithPatchedAmounts("out/migration/round2_reallocate.json");
-        console.log("Round 2b: Executed reallocation from JSON (amounts patched)");
+        _executeReallocateJsonWithPatchedAmounts("out/migration/round4_reallocate.json");
+        console.log("Round 4: Executed reallocation (amounts patched)");
 
         // Verify old market is near-empty
         bytes32 oldMarketCapId = keccak256(abi.encode("this/marketParams", adapter, oldParams));
@@ -163,15 +168,15 @@ contract MigrationIntegrationTest is Test {
         console.log("New deposit successful after migration");
     }
 
-    // ============ ROUND 3: CLEANUP ============
+    // ============ ROUND 5: CLEANUP ============
 
     function testCleanupOldMarketCaps() public {
         // Run full migration first
         testFullMigrationFlow();
 
-        // Execute round3_cleanup.json
-        _executeJsonAsRole("out/migration/round3_cleanup.json", 2, curator);
-        console.log("Round 3: Executed cleanup from JSON");
+        // Execute round5_cleanup.json
+        _executeJsonAsRole("out/migration/round5_cleanup.json", 2, curator);
+        console.log("Round 5: Executed cleanup from JSON");
 
         bytes32 oldCapId = keccak256(abi.encode("this/marketParams", adapter, oldParams));
         assertEq(vault.absoluteCap(oldCapId), 0, "Old market absolute cap should be zero");
@@ -185,9 +190,10 @@ contract MigrationIntegrationTest is Test {
         // Execute JSON rounds without user deposits (vault has only dead deposit as idle USDT).
         // The dead deposit is made before the liquidity adapter is set, so the old market has
         // zero allocation. Reallocation is skipped — only caps + liquidity adapter change needed.
-        _executeJsonAsRole("out/migration/round1_submit.json", 2, curator);
+        _executeJsonAsRole("out/migration/round1_submit_caps.json", 2, curator);
         vm.warp(block.timestamp + Constants.TIMELOCK_LOW + 1);
-        _executeJsonAsRole("out/migration/round2_execute_caps.json", 3, curator);
+        _executeJsonAsRole("out/migration/round2_execute_caps.json", 2, curator);
+        _executeJsonAsRole("out/migration/round3_switch_adapter.json", 1, curator);
 
         // Verify old market has zero allocation (nothing to reallocate)
         bytes32 oldMarketCapId = keccak256(abi.encode("this/marketParams", adapter, oldParams));
@@ -202,6 +208,70 @@ contract MigrationIntegrationTest is Test {
         vm.stopPrank();
 
         assertGt(shares, 0, "Deposit should work after migration");
+    }
+
+    function testPartialLiquidityMigration() public {
+        // Simulate a scenario where there's not enough idle liquidity in the old market
+        // to withdraw everything at once, requiring multiple rounds of reallocation.
+
+        // Large user deposit into the vault (goes to old market via liquidity adapter)
+        address user = makeAddr("user");
+        uint256 depositAmount = 1000e6; // 1000 USDT
+        deal(Constants.USDT, user, depositAmount);
+
+        vm.startPrank(user);
+        IERC20(Constants.USDT).forceApprove(address(vault), depositAmount);
+        vault.deposit(depositAmount, user);
+        vm.stopPrank();
+
+        // The old market already has borrows from mainnet, leaving limited idle liquidity
+
+        // Rounds 1-3: submit caps, wait timelock, execute caps, switch adapter
+        _executeJsonAsRole("out/migration/round1_submit_caps.json", 2, curator);
+        vm.warp(block.timestamp + Constants.TIMELOCK_LOW + 1);
+        _executeJsonAsRole("out/migration/round2_execute_caps.json", 2, curator);
+        _executeJsonAsRole("out/migration/round3_switch_adapter.json", 1, curator);
+
+        // Round 4: Reallocate in multiple passes
+        Id oldMarketId = Id.wrap(Constants.EXISTING_SUSDS_USDT_MARKET_ID);
+        bytes32 oldMarketCapId = keccak256(abi.encode("this/marketParams", adapter, oldParams));
+        uint256 totalMigrated = 0;
+        uint256 passes = 0;
+
+        while (vault.allocation(oldMarketCapId) > 0) {
+            passes++;
+            require(passes <= 10, "Too many reallocation passes");
+
+            // Query available liquidity in the old market
+            Market memory mktState = IMorpho(Constants.MORPHO_BLUE).market(oldMarketId);
+            uint256 available = mktState.totalSupplyAssets - mktState.totalBorrowAssets;
+            if (available == 0) break; // No liquidity left, must wait for borrowers to repay
+
+            uint256 allocationBefore = vault.allocation(oldMarketCapId);
+            uint256 withdrawAmount = available < allocationBefore ? available : allocationBefore;
+
+            // Deallocate what's available from old market
+            vm.prank(curator);
+            vault.deallocate(adapter, abi.encode(oldParams), withdrawAmount);
+
+            // Allocate idle to new market
+            uint256 idle = IERC20(Constants.USDT).balanceOf(address(vault));
+            vm.prank(curator);
+            vault.allocate(adapter, abi.encode(newParams), idle);
+
+            totalMigrated += withdrawAmount;
+            console.log("Pass %d - migrated: %d, total: %d", passes, withdrawAmount, totalMigrated);
+        }
+
+        console.log("Migration completed in", passes, "passes, total migrated:", totalMigrated);
+        assertGt(passes, 0, "Should have done at least one pass");
+
+        // Verify user can still withdraw
+        uint256 userShares = vault.balanceOf(user);
+        vm.startPrank(user);
+        uint256 assetsReceived = vault.redeem(userShares, user, user);
+        vm.stopPrank();
+        assertGt(assetsReceived, 0, "User should receive assets after partial migration");
     }
 
     // ============ JSON EXECUTION HELPERS ============
