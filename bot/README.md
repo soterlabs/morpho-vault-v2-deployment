@@ -92,7 +92,7 @@ crontab -e
 1. **Verify Safe setup** — Confirms bot is a Safe owner and threshold is 1
 2. **Check permissions** — Verifies the Safe is an allocator on the vault
 3. **Read current state** — Gets total assets, adapter total, idle balance
-4. **Early threshold check** — If total deviation < 1%, skip (avoids unnecessary RPC calls)
+4. **Early threshold check** — If total deviation < 0.1%, skip (avoids unnecessary RPC calls)
 5. **Read per-market balances** — Calls `adapter.expectedSupplyAssets(marketId)` for each market
 6. **Compute per-market actions** — Only allocate/deallocate markets that are off-target
 7. **Execute via Safe** — Signs and executes through the Safe multisig with a 50% gas buffer
@@ -117,7 +117,7 @@ After:  [5%, 5%, 5%, 5%]  (20% total)
 ```
 
 ### Case 3: All markets at target
-Total deviation is below the 1% threshold. No actions taken.
+Total deviation is below the 0.1% threshold. No actions taken.
 ```
 Before: [5%, 5%, 5%, 5%]  → No actions
 ```
@@ -137,7 +137,7 @@ After:  [5%, 5%, 5%, 5%]  (20% total)
 ```
 
 ### Case 6: Interest accrual
-Markets accrue interest over time, causing small deviations. As long as the total deviation stays below 1%, no rebalancing is triggered.
+Markets accrue interest over time, causing small deviations. As long as the total deviation stays below 0.1%, no rebalancing is triggered.
 
 ### Fresh state reads + headroom (1 bps)
 The vault's relative cap check uses `mulDivDown(totalAssets, relativeCap, WAD)` to compute the maximum allowed allocation. Interest accrues between the bot's RPC read and tx execution, which can cause the adapter's `expectedSupplyAssets` to overshoot the cap.
@@ -171,7 +171,7 @@ Runs unit tests for the allocation logic covering all cases above, including the
 |----------|---------|-------------|
 | `targetIdlePercent` | 80% | Target idle percentage |
 | `targetPerMarketPercent` | 5% | Target per market |
-| `rebalanceThresholdBps` | 1% | Min deviation to trigger rebalance |
+| `rebalanceThresholdBps` | 0.1% | Min deviation to trigger rebalance |
 | `minAllocationAmount` | 100 USDS | Min amount to allocate (avoids dust) |
 
 ## Security Notes

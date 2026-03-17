@@ -39,7 +39,7 @@ const config = {
   targetPerMarketPercent: 500, // 5% each
 
   // Rebalance threshold - only rebalance if deviation exceeds this (in basis points)
-  rebalanceThresholdBps: 100, // 1%
+  rebalanceThresholdBps: 10, // 0.1%
 
   // Minimum allocation amount (to avoid dust transactions)
   minAllocationAmount: parseEther('100'), // 100 USDS minimum
