@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, type AllocationInput } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, type AllocationInput, type AllocationAction, type MarketLiquidity } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
 // Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each)
@@ -393,6 +393,276 @@ describe('computeAllocationActions', () => {
 
       expect(result.skipped).toBe(true);
       expect(result.reason).toBe('within threshold');
+    });
+  });
+});
+
+// ============================================================
+// capDeallocationsToLiquidity
+// ============================================================
+
+describe('capDeallocationsToLiquidity', () => {
+  // Helper: build a deallocate action
+  function dealloc(marketIndex: number, amount: bigint): AllocationAction {
+    return { marketIndex, action: 'deallocate', amount };
+  }
+
+  // Helper: build market liquidity data
+  function liq(marketIndex: number, totalSupply: bigint, totalBorrow: bigint): MarketLiquidity {
+    return { marketIndex, totalSupplyAssets: totalSupply, totalBorrowAssets: totalBorrow };
+  }
+
+  describe('happy path — plenty of liquidity', () => {
+    it('passes through full amount when liquidity is abundant', () => {
+      // Market has 10M supply, 5M borrow → 5M liquidity, reserve = 500K
+      // Want to deallocate 1M → plenty of room
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('1000000'))],
+        [liq(0, eth('10000000'), eth('5000000'))],
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe(eth('1000000'));
+      expect(result[0].capped).toBe(false);
+      expect(result[0].skipped).toBe(false);
+    });
+
+    it('handles multiple markets with sufficient liquidity', () => {
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('100')), dealloc(1, eth('200')), dealloc(2, eth('300')), dealloc(3, eth('400'))],
+        [
+          liq(0, eth('10000'), eth('5000')),
+          liq(1, eth('10000'), eth('5000')),
+          liq(2, eth('10000'), eth('5000')),
+          liq(3, eth('10000'), eth('5000')),
+        ],
+      );
+
+      expect(result).toHaveLength(4);
+      for (const r of result) {
+        expect(r.capped).toBe(false);
+        expect(r.skipped).toBe(false);
+      }
+      expect(result[0].amount).toBe(eth('100'));
+      expect(result[1].amount).toBe(eth('200'));
+      expect(result[2].amount).toBe(eth('300'));
+      expect(result[3].amount).toBe(eth('400'));
+    });
+  });
+
+  describe('capping — liquidity insufficient for full amount', () => {
+    it('caps to maxWithdrawable when desired exceeds available after reserve', () => {
+      // 2.6M supply, 2.47M borrow → 130K liquidity, reserve = 130K
+      // maxWithdrawable = 130K - 130K = 0  ← this is the edge case from review!
+      // Actually with 2.6M supply: reserve = 2.6M * 5% = 130K
+      // liquidity = 130K, reserve = 130K → maxWithdrawable = 0 → skipped
+      //
+      // Let's use a case where capping actually applies:
+      // 2M supply, 1.5M borrow → 500K liquidity, reserve = 100K
+      // maxWithdrawable = 400K, want 1M → capped to 400K
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('1000000'))],
+        [liq(0, eth('2000000'), eth('1500000'))],
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe(eth('400000'));
+      expect(result[0].capped).toBe(true);
+      expect(result[0].skipped).toBe(false);
+    });
+
+    it('caps each market independently', () => {
+      // Market 0: plenty of liquidity → not capped
+      // Market 1: tight liquidity → capped
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('100')), dealloc(1, eth('100'))],
+        [
+          liq(0, eth('10000'), eth('5000')),     // 5000 liquidity, 500 reserve → 4500 available
+          liq(1, eth('1000'), eth('900')),        // 100 liquidity, 50 reserve → 50 available
+        ],
+      );
+
+      expect(result[0].amount).toBe(eth('100'));
+      expect(result[0].capped).toBe(false);
+      expect(result[1].amount).toBe(eth('50'));
+      expect(result[1].capped).toBe(true);
+    });
+  });
+
+  describe('skipping — no withdrawable liquidity', () => {
+    it('skips when market is at 100% utilization', () => {
+      // 2M supply, 2M borrow → 0 liquidity
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('1000000'))],
+        [liq(0, eth('2000000'), eth('2000000'))],
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe(0n);
+      expect(result[0].skipped).toBe(true);
+      expect(result[0].availableLiquidity).toBe(0n);
+    });
+
+    it('skips when liquidity equals the reserve (edge case)', () => {
+      // 2M supply, 1.9M borrow → 100K liquidity, reserve = 100K
+      // maxWithdrawable = 100K - 100K = 0 → skipped
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('500000'))],
+        [liq(0, eth('2000000'), eth('1900000'))],
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe(0n);
+      expect(result[0].skipped).toBe(true);
+      expect(result[0].availableLiquidity).toBe(eth('100000'));
+    });
+
+    it('skips when liquidity is below the reserve', () => {
+      // 2M supply, 1.95M borrow → 50K liquidity, reserve = 100K
+      // maxWithdrawable = 0 (liquidity < reserve)
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('500000'))],
+        [liq(0, eth('2000000'), eth('1950000'))],
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].skipped).toBe(true);
+    });
+
+    it('skips when no liquidity data is provided for a market', () => {
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('100'))],
+        [], // no liquidity data
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].skipped).toBe(true);
+      expect(result[0].amount).toBe(0n);
+    });
+
+    it('handles all markets skipped', () => {
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('100')), dealloc(1, eth('200'))],
+        [
+          liq(0, eth('1000'), eth('1000')),  // 100% utilization
+          liq(1, eth('1000'), eth('1000')),  // 100% utilization
+        ],
+      );
+
+      expect(result).toHaveLength(2);
+      expect(result.every(r => r.skipped)).toBe(true);
+    });
+  });
+
+  describe('mixed — some markets capped, some not, some skipped', () => {
+    it('handles realistic 4-market scenario', () => {
+      // Market 0: plenty of liquidity
+      // Market 1: needs capping
+      // Market 2: fully utilized (skip)
+      // Market 3: liquidity exactly at reserve (skip)
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('1000')), dealloc(1, eth('1000')), dealloc(2, eth('1000')), dealloc(3, eth('1000'))],
+        [
+          liq(0, eth('100000'), eth('50000')),   // 50K liquidity, 5K reserve → 45K avail
+          liq(1, eth('10000'), eth('9000')),      // 1K liquidity, 500 reserve → 500 avail
+          liq(2, eth('10000'), eth('10000')),     // 0 liquidity
+          liq(3, eth('10000'), eth('9500')),      // 500 liquidity, 500 reserve → 0 avail
+        ],
+      );
+
+      expect(result).toHaveLength(4);
+
+      // Market 0: full amount, not capped
+      expect(result[0].amount).toBe(eth('1000'));
+      expect(result[0].capped).toBe(false);
+      expect(result[0].skipped).toBe(false);
+
+      // Market 1: capped to 500
+      expect(result[1].amount).toBe(eth('500'));
+      expect(result[1].capped).toBe(true);
+      expect(result[1].skipped).toBe(false);
+
+      // Market 2: skipped (no liquidity)
+      expect(result[2].skipped).toBe(true);
+
+      // Market 3: skipped (liquidity equals reserve)
+      expect(result[3].skipped).toBe(true);
+    });
+  });
+
+  describe('edge cases', () => {
+    it('handles empty actions list', () => {
+      const result = capDeallocationsToLiquidity([], []);
+      expect(result).toHaveLength(0);
+    });
+
+    it('handles zero supply market (should not happen but be safe)', () => {
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('100'))],
+        [liq(0, 0n, 0n)],
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].skipped).toBe(true);
+      expect(result[0].availableLiquidity).toBe(0n);
+    });
+
+    it('handles borrow exceeding supply (should not happen on-chain)', () => {
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('100'))],
+        [liq(0, eth('1000'), eth('1500'))],
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].skipped).toBe(true);
+      expect(result[0].availableLiquidity).toBe(0n);
+    });
+
+    it('returns exact amount when desired equals maxWithdrawable', () => {
+      // 10M supply, 5M borrow → 5M liquidity, reserve = 500K
+      // maxWithdrawable = 4.5M, want exactly 4.5M
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('4500000'))],
+        [liq(0, eth('10000000'), eth('5000000'))],
+      );
+
+      expect(result[0].amount).toBe(eth('4500000'));
+      expect(result[0].capped).toBe(false);
+      expect(result[0].skipped).toBe(false);
+    });
+
+    it('caps when desired is 1 wei above maxWithdrawable', () => {
+      // maxWithdrawable = 4.5M, want 4.5M + 1 wei
+      const result = capDeallocationsToLiquidity(
+        [dealloc(0, eth('4500000') + 1n)],
+        [liq(0, eth('10000000'), eth('5000000'))],
+      );
+
+      expect(result[0].amount).toBe(eth('4500000'));
+      expect(result[0].capped).toBe(true);
+    });
+
+    it('preserves market indices in output', () => {
+      // Non-contiguous indices (markets 1 and 3 only)
+      const result = capDeallocationsToLiquidity(
+        [dealloc(1, eth('100')), dealloc(3, eth('200'))],
+        [liq(1, eth('10000'), eth('5000')), liq(3, eth('10000'), eth('5000'))],
+      );
+
+      expect(result[0].marketIndex).toBe(1);
+      expect(result[1].marketIndex).toBe(3);
+    });
+  });
+
+  describe('reserve constant', () => {
+    it('LIQUIDITY_RESERVE_PERCENT is 5', () => {
+      expect(LIQUIDITY_RESERVE_PERCENT).toBe(5n);
+    });
+
+    it('reserve math: 5% of 2.6M = 130K', () => {
+      const totalSupply = eth('2600000');
+      const reserve = totalSupply * LIQUIDITY_RESERVE_PERCENT / 100n;
+      expect(reserve).toBe(eth('130000'));
     });
   });
 });

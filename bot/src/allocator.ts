@@ -22,7 +22,7 @@ import { createPublicClient, createWalletClient, http, formatEther, parseEther, 
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 import 'dotenv/config';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, type MarketLiquidity } from './allocation-logic.js';
 
 // ============ CONFIGURATION ============
 
@@ -93,6 +93,7 @@ const markets: MarketConfig[] = [
 // Constants
 const USDS = '0xdC035D45d973E3EC169d2276DDab16f1e407384F' as Address;
 const IRM_ADAPTIVE = '0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC' as Address;
+const MORPHO_BLUE = '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb' as Address;
 
 // Safe MultiSendCallOnly (v1.4.1) — matches our Safe version
 const MULTISEND = '0x9641d764fc13c8B624c04430C7356C1C7C8102e2' as Address;
@@ -166,6 +167,23 @@ const adapterAbi = [
     stateMutability: 'view',
     inputs: [{ name: 'marketId', type: 'bytes32' }],
     outputs: [{ type: 'uint256' }],
+  },
+] as const;
+
+const morphoBlueAbi = [
+  {
+    name: 'market',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: 'id', type: 'bytes32' }],
+    outputs: [
+      { name: 'totalSupplyAssets', type: 'uint128' },
+      { name: 'totalSupplyShares', type: 'uint128' },
+      { name: 'totalBorrowAssets', type: 'uint128' },
+      { name: 'totalBorrowShares', type: 'uint128' },
+      { name: 'lastUpdate', type: 'uint128' },
+      { name: 'fee', type: 'uint128' },
+    ],
   },
 ] as const;
 
@@ -581,20 +599,55 @@ async function main() {
   const headroom = capLimit * CAP_HEADROOM_BPS / 10000n;
   const effectiveCap = capLimit - headroom;
 
+  // Read available liquidity from Morpho Blue for markets we need to deallocate from.
+  // If a market has high utilization (borrows ≈ supply), we can only withdraw
+  // what's idle in the pool. Cap deallocate amounts to available liquidity.
+  let cappedDeallocations: ReturnType<typeof capDeallocationsToLiquidity> = [];
+  if (deallocateActions.length > 0) {
+    const deallocateMarketIds = deallocateActions.map(a => computeMarketId(configuredMarkets[a.marketIndex]));
+    const marketStates = await Promise.all(
+      deallocateMarketIds.map(id =>
+        publicClient.readContract({
+          address: MORPHO_BLUE,
+          abi: morphoBlueAbi,
+          functionName: 'market',
+          args: [id],
+        }),
+      ),
+    );
+
+    const marketLiquidityData: MarketLiquidity[] = deallocateActions.map((a, i) => {
+      const [totalSupplyAssets, , totalBorrowAssets] = marketStates[i];
+      return { marketIndex: a.marketIndex, totalSupplyAssets, totalBorrowAssets };
+    });
+
+    cappedDeallocations = capDeallocationsToLiquidity(deallocateActions, marketLiquidityData);
+  }
+
   // Build vault calls: deallocations first, then allocations
   // Order matters: deallocations free up idle balance for subsequent allocations
   const vaultCalls: { name: string; action: string; amount: bigint; calldata: Hex }[] = [];
 
-  for (const a of deallocateActions) {
-    const market = configuredMarkets[a.marketIndex];
+  // Build deallocate calls (capped by liquidity)
+  for (const capped of cappedDeallocations) {
+    const market = configuredMarkets[capped.marketIndex];
+
+    if (capped.skipped) {
+      log(`  ${market.name}: insufficient liquidity (${formatEther(capped.availableLiquidity)} available), skipping deallocate`);
+      continue;
+    }
+    if (capped.capped) {
+      log(`  ${market.name}: capping deallocate to ${formatEther(capped.amount)} (${formatEther(capped.availableLiquidity)} liquidity in pool)`);
+    }
+
     vaultCalls.push({
       name: market.name,
       action: 'deallocate',
-      amount: a.amount,
+      amount: capped.amount,
       calldata: encodeFunctionData({
         abi: vaultAbi,
         functionName: 'deallocate',
-        args: [config.adapterAddress, market.encodedParams!, a.amount],
+        args: [config.adapterAddress, market.encodedParams!, capped.amount],
       }),
     });
   }
@@ -622,7 +675,7 @@ async function main() {
   }
 
   if (vaultCalls.length === 0) {
-    log('All markets at cap after fresh reads, no actions needed');
+    log('No executable actions (all markets skipped due to liquidity constraints or cap limits)');
     return;
   }
 

@@ -13,6 +13,13 @@ const WAD = 1_000_000_000_000_000_000n; // 1e18
  */
 export const CAP_HEADROOM_BPS = 1n;
 
+/**
+ * Percentage of pool supply reserved as a liquidity cushion when deallocating.
+ * Prevents the bot from pushing market utilization too high.
+ * 5% means we leave at least 5% of the pool's totalSupply as idle liquidity.
+ */
+export const LIQUIDITY_RESERVE_PERCENT = 5n;
+
 export interface AllocationAction {
   marketIndex: number;
   action: 'allocate' | 'deallocate';
@@ -120,4 +127,66 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
   }
 
   return { actions, skipped: false };
+}
+
+export interface MarketLiquidity {
+  marketIndex: number;
+  totalSupplyAssets: bigint;
+  totalBorrowAssets: bigint;
+}
+
+export interface CappedAction {
+  marketIndex: number;
+  amount: bigint;
+  capped: boolean;       // true if amount was reduced due to liquidity
+  skipped: boolean;      // true if skipped entirely (no withdrawable liquidity)
+  availableLiquidity: bigint;
+}
+
+/**
+ * Cap deallocate amounts to available market liquidity, reserving a cushion
+ * to avoid pushing utilization to 100%.
+ *
+ * For each market:
+ *   reserve = totalSupplyAssets * LIQUIDITY_RESERVE_PERCENT / 100
+ *   maxWithdrawable = max(0, liquidity - reserve)
+ *   actualAmount = min(desiredAmount, maxWithdrawable)
+ */
+export function capDeallocationsToLiquidity(
+  actions: AllocationAction[],
+  marketLiquidity: MarketLiquidity[],
+): CappedAction[] {
+  // Index liquidity by marketIndex for O(1) lookup
+  const liquidityByIndex = new Map<number, MarketLiquidity>();
+  for (const ml of marketLiquidity) {
+    liquidityByIndex.set(ml.marketIndex, ml);
+  }
+
+  return actions.map(a => {
+    const ml = liquidityByIndex.get(a.marketIndex);
+    if (!ml) {
+      // No liquidity data — skip to be safe (shouldn't happen)
+      return { marketIndex: a.marketIndex, amount: 0n, capped: false, skipped: true, availableLiquidity: 0n };
+    }
+
+    const liquidity = ml.totalSupplyAssets > ml.totalBorrowAssets
+      ? ml.totalSupplyAssets - ml.totalBorrowAssets
+      : 0n;
+
+    const reserve = ml.totalSupplyAssets * LIQUIDITY_RESERVE_PERCENT / 100n;
+    const maxWithdrawable = liquidity > reserve ? liquidity - reserve : 0n;
+
+    if (maxWithdrawable === 0n) {
+      return { marketIndex: a.marketIndex, amount: 0n, capped: false, skipped: true, availableLiquidity: liquidity };
+    }
+
+    const actualAmount = a.amount < maxWithdrawable ? a.amount : maxWithdrawable;
+    return {
+      marketIndex: a.marketIndex,
+      amount: actualAmount,
+      capped: actualAmount < a.amount,
+      skipped: false,
+      availableLiquidity: liquidity,
+    };
+  });
 }
