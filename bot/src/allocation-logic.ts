@@ -31,7 +31,11 @@ export interface AllocationInput {
   adapterAssets: bigint;
   perMarketAssets: bigint[];
   targetAllocatedPercent: number; // basis points, e.g. 2000 = 20%
-  targetPerMarketPercent: number; // basis points, e.g. 500 = 5%
+  // Per-market target in basis points, one entry per perMarketAssets[] entry.
+  // E.g. [500, 500, 500, 500] for the legacy 5% per market across 4 markets,
+  // or [0, 1000, 1000, 0] for the deallocation migration scheme.
+  // Sum should match targetAllocatedPercent.
+  targetPerMarketBpsByIndex: number[];
   rebalanceThresholdBps: number; // basis points, e.g. 100 = 1%
 }
 
@@ -81,38 +85,42 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
     adapterAssets,
     perMarketAssets,
     targetAllocatedPercent,
-    targetPerMarketPercent,
+    targetPerMarketBpsByIndex,
     rebalanceThresholdBps,
   } = input;
+
+  if (targetPerMarketBpsByIndex.length !== perMarketAssets.length) {
+    throw new Error(
+      `targetPerMarketBpsByIndex length (${targetPerMarketBpsByIndex.length}) must match perMarketAssets length (${perMarketAssets.length})`
+    );
+  }
 
   if (totalAssets === 0n) {
     return { actions: [], skipped: true, reason: 'totalAssets is zero' };
   }
 
-  const targetTotalAllocated = (totalAssets * BigInt(targetAllocatedPercent)) / 10000n;
-  const targetPerMarket = (totalAssets * BigInt(targetPerMarketPercent)) / 10000n;
+  // targetAllocatedPercent is retained for caller logging / sanity but is no longer
+  // used to short-circuit. With asymmetric per-market targets (e.g. migrating from
+  // 5/5/5/5 to 0/10/10/0), the aggregate can match exactly while per-market
+  // deviations are large. We short-circuit on the maximum per-market deviation instead.
+  void targetAllocatedPercent;
 
-  // Check if total deviation exceeds threshold
-  const allocationDiff = adapterAssets > targetTotalAllocated
-    ? adapterAssets - targetTotalAllocated
-    : targetTotalAllocated - adapterAssets;
-
-  const deviationBps = Number((allocationDiff * 10000n) / totalAssets);
-
-  if (deviationBps < rebalanceThresholdBps) {
-    return { actions: [], skipped: true, reason: 'within threshold' };
-  }
-
-  // Compute per-market actions based on actual on-chain balances
+  // Compute per-market actions and track the worst per-market deviation.
   const actions: AllocationAction[] = [];
+  let maxDeviationBps = 0;
 
   for (let i = 0; i < perMarketAssets.length; i++) {
     const current = perMarketAssets[i];
+    const targetPerMarket = (totalAssets * BigInt(targetPerMarketBpsByIndex[i])) / 10000n;
+
+    const diff = current > targetPerMarket ? current - targetPerMarket : targetPerMarket - current;
+    const devBps = Number((diff * 10000n) / totalAssets);
+    if (devBps > maxDeviationBps) maxDeviationBps = devBps;
 
     if (current < targetPerMarket) {
-      const diff = targetPerMarket - current;
-      if (diff > 0n) {
-        actions.push({ marketIndex: i, action: 'allocate', amount: diff });
+      const deficit = targetPerMarket - current;
+      if (deficit > 0n) {
+        actions.push({ marketIndex: i, action: 'allocate', amount: deficit });
       }
     } else if (current > targetPerMarket) {
       const excess = current - targetPerMarket;
@@ -120,6 +128,10 @@ export function computeAllocationActions(input: AllocationInput): AllocationResu
         actions.push({ marketIndex: i, action: 'deallocate', amount: excess });
       }
     }
+  }
+
+  if (maxDeviationBps < rebalanceThresholdBps) {
+    return { actions: [], skipped: true, reason: 'within threshold' };
   }
 
   if (actions.length === 0) {
