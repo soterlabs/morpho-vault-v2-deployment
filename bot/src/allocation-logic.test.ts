@@ -2,11 +2,14 @@ import { describe, it, expect } from 'vitest';
 import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, type AllocationInput, type AllocationAction, type MarketLiquidity } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
-// Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each)
+// Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each).
+// targetPerMarketBpsByIndex defaults to [500, 500, 500, 500] sized to perMarketAssets.length
+// so most tests don't have to repeat it. Override per test if asymmetric targets are needed.
 function input(overrides: Partial<AllocationInput> & Pick<AllocationInput, 'totalAssets' | 'adapterAssets' | 'perMarketAssets'>): AllocationInput {
+  const numMarkets = overrides.perMarketAssets.length;
   return {
     targetAllocatedPercent: 2000,  // 20%
-    targetPerMarketPercent: 500,   // 5%
+    targetPerMarketBpsByIndex: new Array(numMarkets).fill(500),  // 5% each by default
     rebalanceThresholdBps: 100,    // 1%
     ...overrides,
   };
@@ -329,7 +332,7 @@ describe('computeAllocationActions', () => {
         adapterAssets: 0n,
         perMarketAssets: [0n],
         targetAllocatedPercent: 500,
-        targetPerMarketPercent: 500,
+        targetPerMarketBpsByIndex: [500],
       }));
 
       // Raw deficit — the caller will compute exact amount via computeCapLimit()
@@ -342,10 +345,78 @@ describe('computeAllocationActions', () => {
         adapterAssets: eth('300'),
         perMarketAssets: [eth('75')],
         targetAllocatedPercent: 500,
-        targetPerMarketPercent: 500,
+        targetPerMarketBpsByIndex: [500],
       }));
 
       expect(result.actions[0].amount).toBe(eth('25'));
+    });
+  });
+
+  // ============================================================
+  // Case: Per-market asymmetric targets (deallocation migration)
+  // [stUSDS, cbBTC, wstETH, WETH] with targets [0%, 10%, 10%, 0%]
+  // ============================================================
+  describe('asymmetric per-market targets', () => {
+    it('deallocates fully from markets with target 0 and grows others to their target', () => {
+      // Starting from the 5/5/5/5 = 20% state, migrate to 0/10/10/0 = 20% state
+      const result = computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        adapterAssets: eth('200'),
+        perMarketAssets: [eth('50'), eth('50'), eth('50'), eth('50')],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],  // 0%, 10%, 10%, 0%
+      }));
+
+      expect(result.skipped).toBe(false);
+      expect(result.actions).toHaveLength(4);
+
+      // stUSDS: 50 → 0, deallocate 50
+      expect(result.actions[0]).toEqual({ marketIndex: 0, action: 'deallocate', amount: eth('50') });
+      // cbBTC: 50 → 100, allocate 50
+      expect(result.actions[1]).toEqual({ marketIndex: 1, action: 'allocate', amount: eth('50') });
+      // wstETH: 50 → 100, allocate 50
+      expect(result.actions[2]).toEqual({ marketIndex: 2, action: 'allocate', amount: eth('50') });
+      // WETH: 50 → 0, deallocate 50
+      expect(result.actions[3]).toEqual({ marketIndex: 3, action: 'deallocate', amount: eth('50') });
+    });
+
+    it('emits only deallocate actions when retired markets are still funded but new markets are at target', () => {
+      // Mid-migration: retired markets still have some allocation, cbBTC/wstETH already at 10%
+      const result = computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        adapterAssets: eth('220'),
+        perMarketAssets: [eth('10'), eth('100'), eth('100'), eth('10')],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+      }));
+
+      expect(result.skipped).toBe(false);
+      expect(result.actions).toHaveLength(2);
+      expect(result.actions[0]).toEqual({ marketIndex: 0, action: 'deallocate', amount: eth('10') });
+      expect(result.actions[1]).toEqual({ marketIndex: 3, action: 'deallocate', amount: eth('10') });
+    });
+
+    it('emits no actions when all 4 markets match asymmetric targets exactly', () => {
+      const result = computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        adapterAssets: eth('200'),
+        perMarketAssets: [0n, eth('100'), eth('100'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+      }));
+
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toBe('within threshold');
+    });
+
+    it('skips when target=0 market still has dust below threshold', () => {
+      // stUSDS has 0.5 USDS dust (0.05% of 1000) — total deviation is 0.05%, below 1% threshold
+      const result = computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        adapterAssets: eth('200.5'),
+        perMarketAssets: [eth('0.5'), eth('100'), eth('100'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+      }));
+
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toBe('within threshold');
     });
   });
 
@@ -370,12 +441,21 @@ describe('computeAllocationActions', () => {
         adapterAssets: 0n,
         perMarketAssets: [0n],
         targetAllocatedPercent: 500,
-        targetPerMarketPercent: 500,
+        targetPerMarketBpsByIndex: [500],
       }));
 
       expect(result.skipped).toBe(false);
       expect(result.actions).toHaveLength(1);
       expect(result.actions[0]).toEqual({ marketIndex: 0, action: 'allocate', amount: eth('50') });
+    });
+
+    it('throws when targetPerMarketBpsByIndex length does not match perMarketAssets', () => {
+      expect(() => computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        adapterAssets: 0n,
+        perMarketAssets: [0n, 0n, 0n, 0n],
+        targetPerMarketBpsByIndex: [500, 500],  // 2 targets for 4 markets — should throw
+      }))).toThrow(/targetPerMarketBpsByIndex length \(2\) must match perMarketAssets length \(4\)/);
     });
 
     it('handles interest accrual (market slightly above target)', () => {

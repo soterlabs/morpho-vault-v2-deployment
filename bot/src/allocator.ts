@@ -34,9 +34,9 @@ const config = {
   adapterAddress: process.env.ADAPTER_ADDRESS as Address,
 
   // Target allocation percentages (in basis points, 10000 = 100%)
+  // targetAllocatedPercent must match the sum of all markets' targetBps below.
   targetIdlePercent: 8000, // 80%
   targetAllocatedPercent: 2000, // 20%
-  targetPerMarketPercent: 500, // 5% each
 
   // Rebalance threshold - only rebalance if deviation exceeds this (in basis points)
   rebalanceThresholdBps: 10, // 0.1%
@@ -54,6 +54,9 @@ interface MarketConfig {
   collateral: Address;
   oracle: Address;
   lltv: bigint;
+  // Per-market target allocation in basis points (10000 = 100%).
+  // Sum across all configured markets must equal config.targetAllocatedPercent.
+  targetBps: number;
   encodedParams?: Hex;
 }
 
@@ -63,30 +66,39 @@ const LLTV_86_PERCENT = '860000000000000000';
 // Existing stUSDS oracle from USDS vault deployment
 const EXISTING_STUSDS_ORACLE = '0x0A976226d113B67Bd42D672Ac9f83f92B44b454C';
 
+// Per-market target defaults (basis points). Override via env vars.
+// Legacy default is 500 (5%) each, matching the original 5/5/5/5 = 20% scheme.
+// For the stUSDS+WETH deallocation migration, set TARGET_STUSDS_BPS=0 TARGET_WETH_BPS=0
+// TARGET_CBBTC_BPS=1000 TARGET_WSTETH_BPS=1000 (sum still equals targetAllocatedPercent=2000).
+const DEFAULT_TARGET_BPS = 500;
 const markets: MarketConfig[] = [
   {
     name: 'stUSDS/USDS',
     collateral: '0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9' as Address,
     oracle: (process.env.ORACLE_STUSDS || EXISTING_STUSDS_ORACLE) as Address,
     lltv: BigInt(process.env.LLTV_STUSDS || LLTV_86_PERCENT),
+    targetBps: Number(process.env.TARGET_STUSDS_BPS ?? DEFAULT_TARGET_BPS),
   },
   {
     name: 'cbBTC/USDS',
     collateral: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' as Address,
     oracle: (process.env.ORACLE_CBBTC || '0x0') as Address,
     lltv: BigInt(process.env.LLTV_CBBTC || LLTV_86_PERCENT),
+    targetBps: Number(process.env.TARGET_CBBTC_BPS ?? DEFAULT_TARGET_BPS),
   },
   {
     name: 'wstETH/USDS',
     collateral: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0' as Address,
     oracle: (process.env.ORACLE_WSTETH || '0x0') as Address,
     lltv: BigInt(process.env.LLTV_WSTETH || LLTV_86_PERCENT),
+    targetBps: Number(process.env.TARGET_WSTETH_BPS ?? DEFAULT_TARGET_BPS),
   },
   {
     name: 'WETH/USDS',
     collateral: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' as Address,
     oracle: (process.env.ORACLE_WETH || '0x0') as Address,
     lltv: BigInt(process.env.LLTV_WETH || LLTV_86_PERCENT),
+    targetBps: Number(process.env.TARGET_WETH_BPS ?? DEFAULT_TARGET_BPS),
   },
 ];
 
@@ -502,12 +514,11 @@ async function main() {
 
   // Calculate target allocations
   const targetTotalAllocated = (totalAssets * BigInt(config.targetAllocatedPercent)) / 10000n;
-  const targetPerMarket = (totalAssets * BigInt(config.targetPerMarketPercent)) / 10000n;
 
   log('Target allocations:', {
     targetTotalAllocated: formatEther(targetTotalAllocated),
-    targetPerMarket: formatEther(targetPerMarket),
     targetIdlePercent: config.targetIdlePercent / 100,
+    perMarketTargetsBps: markets.map(m => `${m.name}: ${m.targetBps}`),
   });
 
   // Check if rebalancing is needed
@@ -550,12 +561,13 @@ async function main() {
   }
 
   // Compute per-market allocation/deallocation actions
+  const targetPerMarketBpsByIndex = configuredMarkets.map(m => m.targetBps);
   const result = computeAllocationActions({
     totalAssets,
     adapterAssets,
     perMarketAssets,
     targetAllocatedPercent: config.targetAllocatedPercent,
-    targetPerMarketPercent: config.targetPerMarketPercent,
+    targetPerMarketBpsByIndex,
     rebalanceThresholdBps: config.rebalanceThresholdBps,
   });
 
@@ -569,7 +581,6 @@ async function main() {
   const allocateActions = result.actions.filter(a => a.action === 'allocate');
 
   // Fresh reads for allocation markets (all in parallel, single consistent snapshot)
-  const relativeCapWad = bpsToWad(config.targetPerMarketPercent);
   const freshExpectedByIndex = new Map<number, bigint>();
   let freshTotalAssets = totalAssets;
 
@@ -594,10 +605,14 @@ async function main() {
     allocateActions.forEach((a, i) => freshExpectedByIndex.set(a.marketIndex, freshExpected[i]));
   }
 
-  // Compute cap limit with headroom (shared by all allocations in this batch)
-  const capLimit = computeCapLimit(freshTotalAssets, relativeCapWad);
-  const headroom = capLimit * CAP_HEADROOM_BPS / 10000n;
-  const effectiveCap = capLimit - headroom;
+  // Per-market cap limit (with headroom) — computed in the allocate loop below
+  // since each market may have a different targetBps.
+  const computeEffectiveCap = (marketIndex: number): bigint => {
+    const targetBps = configuredMarkets[marketIndex].targetBps;
+    const capLimit = computeCapLimit(freshTotalAssets, bpsToWad(targetBps));
+    const headroom = capLimit * CAP_HEADROOM_BPS / 10000n;
+    return capLimit - headroom;
+  };
 
   // Read available liquidity from Morpho Blue for markets we need to deallocate from.
   // If a market has high utilization (borrows ≈ supply), we can only withdraw
@@ -655,10 +670,11 @@ async function main() {
   for (const a of allocateActions) {
     const market = configuredMarkets[a.marketIndex];
     const freshExpected = freshExpectedByIndex.get(a.marketIndex)!;
+    const effectiveCap = computeEffectiveCap(a.marketIndex);
     const execAmount = effectiveCap > freshExpected ? effectiveCap - freshExpected : 0n;
 
     if (execAmount === 0n) {
-      log(`  ${market.name}: already at cap (${formatEther(freshExpected)} >= ${formatEther(effectiveCap)}), skipping`);
+      log(`  ${market.name}: already at cap (${formatEther(freshExpected)} >= ${formatEther(effectiveCap)}, target ${market.targetBps} bps), skipping`);
       continue;
     }
 
@@ -686,7 +702,13 @@ async function main() {
     log(`  ${call.action} ${formatEther(call.amount)} USDS ${direction} ${call.name}`);
   }
   if (allocateActions.length > 0) {
-    log(`  (cap: ${formatEther(capLimit)}, headroom: ${formatEther(headroom)})`);
+    const capSummary = allocateActions
+      .map(a => {
+        const m = configuredMarkets[a.marketIndex];
+        return `${m.name}@${m.targetBps}bps→${formatEther(computeEffectiveCap(a.marketIndex))}`;
+      })
+      .join(', ');
+    log(`  (effective caps: ${capSummary})`);
   }
 
   if (config.dryRun) {
