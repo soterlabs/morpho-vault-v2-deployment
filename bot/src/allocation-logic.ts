@@ -272,6 +272,53 @@ export function planAllocations(items: AllocatePlanItem[], minAmount: bigint): A
   });
 }
 
+/**
+ * Constrain a set of planned allocations to a shared budget — the room left under the
+ * vault's AGGREGATE adapter cap (e.g. 20%) after this cycle's deallocations.
+ *
+ * The per-market effective caps only bound each market individually; nothing stops their
+ * SUM from pushing the adapter over its aggregate cap, which reverts the whole atomic
+ * batch (RelativeCapExceeded). This is especially likely mid-migration: when retiring
+ * markets can only be partially drained (liquidity-limited) but the growing markets
+ * allocate at full size, the adapter balloons past its cap.
+ *
+ * If the total fits the budget, allocations pass through unchanged. Otherwise each is
+ * scaled down proportionally to its share of the total, and any result below minAmount is
+ * dropped as dust. A non-positive budget (adapter already at/over cap) yields no
+ * allocations — the bot just deallocates this cycle and grows next cycle as room frees up.
+ */
+/**
+ * Room available for new allocations this cycle under the vault's AGGREGATE adapter cap.
+ *
+ * Allocations are funded from the vault's idle balance, independent of this cycle's
+ * deallocations, so their total must keep the adapter position — `adapterAssets` now, minus
+ * what we deallocate this cycle (deallocations execute first in the atomic batch) — under
+ * its cap. Returns 0 when the adapter is already at/over cap, i.e. a deallocate-only cycle.
+ *
+ * Note: this is intentionally conservative. `adapterAssets` should be the live, fully-accrued
+ * adapter total (realAssets), which is >= the vault's internally-tracked `allocation[id]`
+ * that the cap is actually enforced against, and `adapterCap` is derived from the bot's
+ * current totalAssets read which is <= the vault's post-accrual firstTotalAssets — so the
+ * real on-chain headroom is always at least this budget.
+ */
+export function computeAllocationBudget(adapterCap: bigint, adapterAssets: bigint, totalDeallocated: bigint): bigint {
+  const adapterAfterDealloc = adapterAssets - totalDeallocated;
+  return adapterCap > adapterAfterDealloc ? adapterCap - adapterAfterDealloc : 0n;
+}
+
+export function capAllocationsToBudget(
+  allocations: { marketIndex: number; amount: bigint }[],
+  budget: bigint,
+  minAmount: bigint,
+): { marketIndex: number; amount: bigint }[] {
+  if (budget <= 0n) return [];
+  const total = allocations.reduce((sum, a) => sum + a.amount, 0n);
+  if (total <= budget) return allocations;
+  return allocations
+    .map(a => ({ marketIndex: a.marketIndex, amount: (a.amount * budget) / total }))
+    .filter(a => a.amount >= minAmount);
+}
+
 export interface MarketLiquidity {
   marketIndex: number;
   totalSupplyAssets: bigint;

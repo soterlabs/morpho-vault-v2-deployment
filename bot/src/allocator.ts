@@ -24,7 +24,7 @@ import { createPublicClient, createWalletClient, http, formatEther, parseEther, 
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 import 'dotenv/config';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, parseTargetBps, validateTargetBpsSum, planDeallocations, planAllocations, type MarketLiquidity, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, parseTargetBps, validateTargetBpsSum, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type MarketLiquidity, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
 
 // ============ CONFIGURATION ============
 
@@ -45,6 +45,11 @@ const config = {
 
   // Minimum allocation amount (to avoid dust transactions)
   minAllocationAmount: parseEther('100'), // 100 USDS minimum
+
+  // Optional per-market cap on how much to deallocate in a single cycle (USDS). Lets the
+  // migration proceed in smaller, gentler steps. 0 (default) means no extra cap — each
+  // deallocation is limited only by the target and the pool's available liquidity.
+  maxDeallocatePerCycle: parseEther(process.env.MAX_DEALLOCATE_USDS || '0'),
 
   // Dry run mode (set to true to simulate without executing)
   dryRun: process.env.DRY_RUN === 'true',
@@ -124,6 +129,12 @@ if (undrainable.length > 0) {
     `a retired market cannot be drained without its oracle. Set their ORACLE_* env vars ` +
     `(e.g. ORACLE_WETH for the migration) before running.`
   );
+}
+
+// parseEther accepts a leading '-', so a fat-fingered negative would silently disable the
+// cap (the > 0n guard skips it). Reject it loudly instead.
+if (config.maxDeallocatePerCycle < 0n) {
+  throw new Error(`MAX_DEALLOCATE_USDS must be >= 0, got "${process.env.MAX_DEALLOCATE_USDS}"`);
 }
 
 // Constants
@@ -366,6 +377,15 @@ function computeCollateralCapId(market: MarketConfig): Hex {
     ['collateralToken', market.collateral],
   );
   return keccak256(encoded);
+}
+
+/**
+ * Compute the vault's relative-cap id for the adapter itself (the aggregate cap covering
+ * everything the adapter allocates). Mirrors keccak256(abi.encode("this", adapter)) used
+ * at configuration time (see test/flagship/DeployFlagshipScript.t.sol).
+ */
+function computeAdapterCapId(adapter: Address): Hex {
+  return keccak256(encodeAbiParameters([{ type: 'string' }, { type: 'address' }], ['this', adapter]));
 }
 
 function log(message: string, data?: unknown) {
@@ -656,20 +676,46 @@ async function main() {
   const deallocateActions = result.actions.filter(a => a.action === 'deallocate');
   const allocateActions = result.actions.filter(a => a.action === 'allocate');
 
+  // Optionally cap each deallocation to a smaller per-cycle size for a gentler migration.
+  // (Liquidity capping below still applies on top of this.)
+  if (config.maxDeallocatePerCycle > 0n) {
+    for (const a of deallocateActions) {
+      if (a.amount > config.maxDeallocatePerCycle) {
+        log(`  ${configuredMarkets[a.marketIndex].name}: limiting deallocate to ${formatEther(config.maxDeallocatePerCycle)} per cycle (wanted ${formatEther(a.amount)})`);
+        a.amount = config.maxDeallocatePerCycle;
+      }
+    }
+  }
+
   // Fresh reads for allocation markets (all in parallel, single consistent snapshot)
   const freshExpectedByIndex = new Map<number, bigint>();
   // On-chain relative cap (WAD) per allocate market's collateral, to clamp allocations.
   const onchainRelativeCapWadByIndex = new Map<number, bigint>();
   let freshTotalAssets = totalAssets;
+  let freshAdapterAssets = adapterAssets;
+  // Effective headroom under the vault's AGGREGATE adapter cap (e.g. 20%), with headroom.
+  // Allocations this cycle must keep the adapter total below this, or the batch reverts.
+  let adapterAllocationCap = 0n;
 
   if (allocateActions.length > 0) {
     const allocateMarketIds = allocateActions.map(a => computeMarketId(configuredMarkets[a.marketIndex]));
     const allocateCapIds = allocateActions.map(a => computeCollateralCapId(configuredMarkets[a.marketIndex]));
-    const [freshTotal, freshExpected, relativeCaps] = await Promise.all([
+    const [freshTotal, freshAdapter, adapterRelativeCapWad, freshExpected, relativeCaps] = await Promise.all([
       publicClient.readContract({
         address: config.vaultAddress,
         abi: vaultAbi,
         functionName: 'totalAssets',
+      }),
+      publicClient.readContract({
+        address: config.adapterAddress,
+        abi: adapterAbi,
+        functionName: 'realAssets',
+      }),
+      publicClient.readContract({
+        address: config.vaultAddress,
+        abi: vaultAbi,
+        functionName: 'relativeCap',
+        args: [computeAdapterCapId(config.adapterAddress)],
       }),
       Promise.all(allocateMarketIds.map(id =>
         publicClient.readContract({
@@ -689,6 +735,9 @@ async function main() {
       )),
     ]);
     freshTotalAssets = freshTotal;
+    freshAdapterAssets = freshAdapter;
+    const adapterCapLimit = computeCapLimit(freshTotalAssets, adapterRelativeCapWad);
+    adapterAllocationCap = adapterCapLimit - adapterCapLimit * CAP_HEADROOM_BPS / 10000n;
     allocateActions.forEach((a, i) => {
       freshExpectedByIndex.set(a.marketIndex, freshExpected[i]);
       onchainRelativeCapWadByIndex.set(a.marketIndex, relativeCaps[i]);
@@ -763,6 +812,10 @@ async function main() {
     availableLiquidity: c.availableLiquidity,
   }));
 
+  // Deallocations execute first in the atomic batch, so by the time the allocations run the
+  // adapter is lighter by this much — which is the room the allocations may use under the
+  // aggregate cap.
+  let totalDeallocated = 0n;
   for (const outcome of planDeallocations(deallocatePlan, config.minAllocationAmount)) {
     const market = configuredMarkets[outcome.marketIndex];
     if (outcome.status === 'skip-liquidity') {
@@ -776,6 +829,7 @@ async function main() {
     if (outcome.capped) {
       log(`  ${market.name}: capping deallocate to ${formatEther(outcome.amount)} (${formatEther(outcome.availableLiquidity)} liquidity in pool)`);
     }
+    totalDeallocated += outcome.amount;
     vaultCalls.push({
       name: market.name,
       action: 'deallocate',
@@ -796,23 +850,39 @@ async function main() {
     freshExpected: freshExpectedByIndex.get(info.marketIndex)!,
   }));
 
+  const plannedAllocations: { marketIndex: number; amount: bigint }[] = [];
   for (const outcome of planAllocations(allocatePlan, config.minAllocationAmount)) {
-    const market = configuredMarkets[outcome.marketIndex];
-    if (outcome.status === 'skip-atcap') {
-      continue;
-    }
+    if (outcome.status === 'skip-atcap') continue;
     if (outcome.status === 'skip-dust') {
+      const market = configuredMarkets[outcome.marketIndex];
       log(`  ${market.name}: allocate ${formatEther(outcome.gap)} below minimum (${formatEther(config.minAllocationAmount)}, target ${market.targetBps} bps), skipping`);
       continue;
     }
+    plannedAllocations.push({ marketIndex: outcome.marketIndex, amount: outcome.amount });
+  }
+
+  // Constrain total allocations to the room left under the aggregate adapter cap AFTER this
+  // cycle's deallocations. Each market is already within its own collateral cap, but their
+  // SUM can still push the adapter past its 20% cap and revert the whole atomic batch —
+  // especially when retiring markets can only be partially drained. Scale to fit; while the
+  // adapter is at/over cap the budget is ~0, so the bot just deallocates and grows next cycle.
+  const allocationBudget = computeAllocationBudget(adapterAllocationCap, freshAdapterAssets, totalDeallocated);
+  const plannedTotal = plannedAllocations.reduce((sum, a) => sum + a.amount, 0n);
+  const budgetedAllocations = capAllocationsToBudget(plannedAllocations, allocationBudget, config.minAllocationAmount);
+  if (plannedTotal > allocationBudget) {
+    log(`  Allocations limited by adapter cap: wanted ${formatEther(plannedTotal)}, budget ${formatEther(allocationBudget)} (adapter cap ${formatEther(adapterAllocationCap)}, adapter after deallocations ${formatEther(freshAdapterAssets - totalDeallocated)})`);
+  }
+
+  for (const { marketIndex, amount } of budgetedAllocations) {
+    const market = configuredMarkets[marketIndex];
     vaultCalls.push({
       name: market.name,
       action: 'allocate',
-      amount: outcome.amount,
+      amount,
       calldata: encodeFunctionData({
         abi: vaultAbi,
         functionName: 'allocate',
-        args: [config.adapterAddress, market.encodedParams!, outcome.amount],
+        args: [config.adapterAddress, market.encodedParams!, amount],
       }),
     });
   }

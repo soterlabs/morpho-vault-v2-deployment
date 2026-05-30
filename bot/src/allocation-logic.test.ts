@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, planDeallocations, planAllocations, type AllocationInput, type AllocationAction, type MarketLiquidity, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, planDeallocations, planAllocations, capAllocationsToBudget, computeAllocationBudget, type AllocationInput, type AllocationAction, type MarketLiquidity, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
 // Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each).
@@ -1053,5 +1053,84 @@ describe('planAllocations', () => {
   it('a grown market sitting 1 bps under cap (headroom) is skip-atcap, not a dust log', () => {
     // effectiveCap == freshExpected (market already at the clamped cap) → routine no-op.
     expect(planAllocations([item(1, eth('2000000'), eth('2000000'))], MIN)).toEqual([{ marketIndex: 1, status: 'skip-atcap' }]);
+  });
+});
+
+// ============================================================
+// computeAllocationBudget — room under the aggregate adapter cap after deallocations
+// ============================================================
+describe('computeAllocationBudget', () => {
+  it('returns the room under the cap after deallocations', () => {
+    // adapter 200 now, cap 210, deallocate 30 → after = 170, budget = 40
+    expect(computeAllocationBudget(eth('210'), eth('200'), eth('30'))).toBe(eth('40'));
+  });
+
+  it('returns 0 when the adapter is already at/over cap and deallocations do not bring it under', () => {
+    // adapter 220 now (over cap 210), deallocate 5 → after = 215 > cap → budget 0
+    expect(computeAllocationBudget(eth('210'), eth('220'), eth('5'))).toBe(0n);
+  });
+
+  it('returns 0 exactly at the cap (no room)', () => {
+    expect(computeAllocationBudget(eth('210'), eth('210'), 0n)).toBe(0n);
+  });
+
+  it('reproduces the incident: over-cap adapter, partial drain → small positive budget', () => {
+    // From the live revert: adapter cap ~8,205,693 (20% w/ headroom), adapter 8,995,571,
+    // deallocated 1,317,750 → after ~7,677,821 → budget ~527,872 (not the 3.94M it tried).
+    const budget = computeAllocationBudget(
+      eth('8205692.812'),
+      eth('8995570.813448031967940668'),
+      eth('1317749.962128748417536743'),
+    );
+    expect(budget).toBeGreaterThan(eth('527000'));
+    expect(budget).toBeLessThan(eth('528000'));
+  });
+});
+
+// ============================================================
+// capAllocationsToBudget — constrain total allocations to the aggregate adapter cap
+// ============================================================
+describe('capAllocationsToBudget', () => {
+  const MIN = eth('100');
+
+  it('passes allocations through unchanged when they fit the budget', () => {
+    const allocs = [{ marketIndex: 1, amount: eth('300') }, { marketIndex: 2, amount: eth('200') }];
+    expect(capAllocationsToBudget(allocs, eth('1000'), MIN)).toEqual(allocs);
+  });
+
+  it('returns nothing when the budget is zero or negative (adapter at/over cap)', () => {
+    const allocs = [{ marketIndex: 1, amount: eth('300') }];
+    expect(capAllocationsToBudget(allocs, 0n, MIN)).toEqual([]);
+    expect(capAllocationsToBudget(allocs, -5n, MIN)).toEqual([]);
+  });
+
+  it('scales allocations proportionally to fit the budget', () => {
+    // Reproduces the revert scenario: wanted ~3.94M, budget ~0.53M.
+    // cbBTC 1,994,052.55 and wstETH 1,950,187.18 → total 3,944,239.73; budget 527,874.
+    const allocs = [
+      { marketIndex: 1, amount: eth('1994052.554769614499589676') },
+      { marketIndex: 2, amount: eth('1950187.180984754322095547') },
+    ];
+    const budget = eth('527874');
+    const out = capAllocationsToBudget(allocs, budget, MIN);
+    const total = out.reduce((s, a) => s + a.amount, 0n);
+    // Scaled total never exceeds the budget (this is what keeps the adapter under its cap).
+    expect(total).toBeLessThanOrEqual(budget);
+    // Proportions preserved: cbBTC was slightly larger, so it stays slightly larger.
+    expect(out[0].amount).toBeGreaterThan(out[1].amount);
+    // Each market got a meaningful share (~half the budget), not zero.
+    expect(out[0].amount).toBeGreaterThan(eth('260000'));
+    expect(out[1].amount).toBeGreaterThan(eth('260000'));
+  });
+
+  it('drops a scaled-down allocation that falls below the dust floor', () => {
+    // One huge market dominates the budget; the tiny one scales below MIN and is dropped.
+    const allocs = [
+      { marketIndex: 1, amount: eth('1000000') },
+      { marketIndex: 2, amount: eth('100') },
+    ];
+    const out = capAllocationsToBudget(allocs, eth('500'), MIN);
+    expect(out.map(a => a.marketIndex)).toEqual([1]);
+    expect(out[0].amount).toBeLessThanOrEqual(eth('500'));
   });
 });

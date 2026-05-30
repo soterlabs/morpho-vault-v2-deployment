@@ -202,6 +202,18 @@ Runs unit tests for the allocation logic covering all cases above, including the
 | `TARGET_<MARKET>_BPS` | 500 (5%) | Per-market target in basis points (env-overridable, see Strategy) |
 | `rebalanceThresholdBps` | 0.1% | Min per-market deviation to trigger rebalance |
 | `minAllocationAmount` | 100 USDS | Min per-action amount to allocate/deallocate (suppresses dust transactions) |
+| `MAX_DEALLOCATE_USDS` | 0 (no cap) | Optional per-market cap on deallocation per cycle, for a gentler migration |
+
+### Aggregate adapter cap
+
+Each allocation is bounded not just by its own market's relative cap but by the vault's
+**aggregate adapter cap** (20%). Because allocations are funded from the vault's idle
+balance — not from that cycle's deallocations — the bot must keep the *sum* of allocations
+within the room left under the 20% cap after deallocations; otherwise the whole atomic
+batch reverts with `RelativeCapExceeded`. This matters mid-migration: when the retiring
+markets can only be partially drained (pool liquidity), the bot scales its allocations down
+to fit the cap and grows the destination markets over successive cycles instead of
+overshooting in one shot.
 
 ## Security Notes
 
