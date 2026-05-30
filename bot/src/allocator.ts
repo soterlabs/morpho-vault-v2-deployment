@@ -2,13 +2,15 @@
  * Flagship Vault V2 Allocator Bot
  *
  * This bot maintains the 80% idle / 20% allocated strategy for the Flagship USDS Vault.
- * It allocates 5% to each of 4 markets: stUSDS, cbBTC, wstETH, WETH (all with USDS as loan token).
+ * It allocates across 4 markets: stUSDS, cbBTC, wstETH, WETH (all with USDS as loan token).
+ * Each market has its own target in basis points (default 5% each, sum = 20%), overridable
+ * via TARGET_<MARKET>_BPS env vars to support asymmetric targets / deallocation migrations.
  *
  * Transactions are executed through a Safe 1/3 multisig. The bot is one of the 3 signers
  * and can execute autonomously since the threshold is 1.
  *
- * Run as a cronjob (e.g., every hour):
- *   0 * * * * cd /path/to/bot && npm run allocate >> /var/log/allocator.log 2>&1
+ * Run as a cronjob (deployed every 6 hours, i.e. cron "0 0,6,12,18 * * *"):
+ *   0 0,6,12,18 * * * cd /path/to/bot && npm run allocate >> /var/log/allocator.log 2>&1
  *
  * Environment Variables (see .env.example):
  *   - RPC_URL: Ethereum RPC endpoint
@@ -22,7 +24,7 @@ import { createPublicClient, createWalletClient, http, formatEther, parseEther, 
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet } from 'viem/chains';
 import 'dotenv/config';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, type MarketLiquidity } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, parseTargetBps, validateTargetBpsSum, planDeallocations, planAllocations, type MarketLiquidity, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
 
 // ============ CONFIGURATION ============
 
@@ -77,30 +79,52 @@ const markets: MarketConfig[] = [
     collateral: '0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9' as Address,
     oracle: (process.env.ORACLE_STUSDS || EXISTING_STUSDS_ORACLE) as Address,
     lltv: BigInt(process.env.LLTV_STUSDS || LLTV_86_PERCENT),
-    targetBps: Number(process.env.TARGET_STUSDS_BPS ?? DEFAULT_TARGET_BPS),
+    targetBps: parseTargetBps(process.env.TARGET_STUSDS_BPS, DEFAULT_TARGET_BPS, 'TARGET_STUSDS_BPS'),
   },
   {
     name: 'cbBTC/USDS',
     collateral: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' as Address,
     oracle: (process.env.ORACLE_CBBTC || '0x0') as Address,
     lltv: BigInt(process.env.LLTV_CBBTC || LLTV_86_PERCENT),
-    targetBps: Number(process.env.TARGET_CBBTC_BPS ?? DEFAULT_TARGET_BPS),
+    targetBps: parseTargetBps(process.env.TARGET_CBBTC_BPS, DEFAULT_TARGET_BPS, 'TARGET_CBBTC_BPS'),
   },
   {
     name: 'wstETH/USDS',
     collateral: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0' as Address,
     oracle: (process.env.ORACLE_WSTETH || '0x0') as Address,
     lltv: BigInt(process.env.LLTV_WSTETH || LLTV_86_PERCENT),
-    targetBps: Number(process.env.TARGET_WSTETH_BPS ?? DEFAULT_TARGET_BPS),
+    targetBps: parseTargetBps(process.env.TARGET_WSTETH_BPS, DEFAULT_TARGET_BPS, 'TARGET_WSTETH_BPS'),
   },
   {
     name: 'WETH/USDS',
     collateral: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' as Address,
     oracle: (process.env.ORACLE_WETH || '0x0') as Address,
     lltv: BigInt(process.env.LLTV_WETH || LLTV_86_PERCENT),
-    targetBps: Number(process.env.TARGET_WETH_BPS ?? DEFAULT_TARGET_BPS),
+    targetBps: parseTargetBps(process.env.TARGET_WETH_BPS, DEFAULT_TARGET_BPS, 'TARGET_WETH_BPS'),
   },
 ];
+
+// Fail fast on a misconfigured strategy: the per-market targets must sum to the
+// overall allocated target, otherwise the idle/allocated split silently drifts.
+// Validated over ALL markets (not just oracle-configured ones) so that a partial
+// deployment doesn't false-positive. NOTE: a market that needs allocation OR
+// deallocation must also have its oracle set (see the m.oracle !== '0x0' filter in
+// main) — e.g. the migration requires ORACLE_WETH so WETH can be drained to 0%.
+validateTargetBpsSum(markets.map(m => ({ label: m.name, bps: m.targetBps })), config.targetAllocatedPercent);
+
+// Hard-fail when a retired market (targetBps === 0) has no oracle. target-0 means "this
+// market must hold nothing", but without an oracle it can't be addressed or drained, so
+// any funds it holds are stranded and the 80% idle buffer silently breaks. Unlike a
+// target>0 market with no oracle (which merely can't be funded — a non-fatal shortfall,
+// warned at runtime), this is a fund-safety issue, so we refuse to start.
+const undrainable = markets.filter(m => m.targetBps === 0 && m.oracle === '0x0');
+if (undrainable.length > 0) {
+  throw new Error(
+    `${undrainable.map(m => m.name).join(', ')} have targetBps=0 but no oracle configured — ` +
+    `a retired market cannot be drained without its oracle. Set their ORACLE_* env vars ` +
+    `(e.g. ORACLE_WETH for the migration) before running.`
+  );
+}
 
 // Constants
 const USDS = '0xdC035D45d973E3EC169d2276DDab16f1e407384F' as Address;
@@ -126,6 +150,16 @@ const vaultAbi = [
     stateMutability: 'view',
     inputs: [{ name: 'account', type: 'address' }],
     outputs: [{ type: 'bool' }],
+  },
+  {
+    // Per-id relative cap in WAD (e.g. 1e17 = 10%). capId for a collateral is
+    // keccak256(abi.encode("collateralToken", collateral)). Used to clamp allocations
+    // so we never exceed the on-chain cap (which would revert the whole batch).
+    name: 'relativeCap',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: 'id', type: 'bytes32' }],
+    outputs: [{ type: 'uint256' }],
   },
   {
     name: 'allocate',
@@ -317,6 +351,19 @@ function computeMarketId(market: MarketConfig): Hex {
       { name: 'lltv', type: 'uint256' },
     ],
     [USDS, market.collateral, market.oracle, IRM_ADAPTIVE, market.lltv],
+  );
+  return keccak256(encoded);
+}
+
+/**
+ * Compute the vault's relative-cap id for a market's collateral token.
+ * Mirrors the on-chain derivation keccak256(abi.encode("collateralToken", collateral))
+ * used when the caps were configured (see test/flagship/DeployFlagshipScript.t.sol).
+ */
+function computeCollateralCapId(market: MarketConfig): Hex {
+  const encoded = encodeAbiParameters(
+    [{ type: 'string' }, { type: 'address' }],
+    ['collateralToken', market.collateral],
   );
   return keccak256(encoded);
 }
@@ -521,26 +568,53 @@ async function main() {
     perMarketTargetsBps: markets.map(m => `${m.name}: ${m.targetBps}`),
   });
 
-  // Check if rebalancing is needed
+  // Aggregate deviation is informational only. We deliberately do NOT short-circuit
+  // on it: with asymmetric per-market targets (e.g. migrating 5/5/5/5 → 0/10/10/0),
+  // the aggregate allocated can match targetAllocatedPercent exactly while individual
+  // markets are far off target. The per-market decision (and threshold short-circuit)
+  // lives in computeAllocationActions below, which is the single source of truth.
   const allocationDiff = adapterAssets > targetTotalAllocated
     ? adapterAssets - targetTotalAllocated
     : targetTotalAllocated - adapterAssets;
 
-  const deviationBps = totalAssets > 0n
+  const aggregateDeviationBps = totalAssets > 0n
     ? Number((allocationDiff * 10000n) / totalAssets)
     : 0;
 
-  log(`Current deviation: ${deviationBps / 100}% (threshold: ${config.rebalanceThresholdBps / 100}%)`);
+  log(`Aggregate deviation: ${aggregateDeviationBps / 100}% (per-market threshold: ${config.rebalanceThresholdBps / 100}%)`);
 
-  if (deviationBps < config.rebalanceThresholdBps) {
-    log('Allocation within threshold, no rebalancing needed');
-    return;
-  }
-
-  // Read per-market allocations from the adapter
+  // Read per-market allocations from the adapter. The target-sum invariant is
+  // validated once at module load (see validateTargetBpsSum above).
   const configuredMarkets = markets.filter(m => m.oracle !== '0x0');
   for (const market of configuredMarkets) {
     market.encodedParams = encodeMarketParams(market);
+  }
+
+  // Any market without an oracle is filtered out above and is therefore entirely
+  // ignored — neither allocated to nor deallocated from. This is a silent footgun:
+  //  - a positive-target market would never be funded; and
+  //  - critically, a target-0 market that STILL HOLDS funds (e.g. WETH mid-migration)
+  //    can never be drained, so the migration stalls forever with no signal.
+  // We cannot detect the held-funds case on-chain — a market's id is derived from its
+  // oracle, so an oracle-less market can't even be addressed or balance-read. The only
+  // available signal is the missing oracle itself, so warn loudly for every such market
+  // regardless of target. The sum invariant (validateTargetBpsSum) cannot catch this.
+  const oracleless = markets.filter(m => m.oracle === '0x0');
+  if (oracleless.length > 0) {
+    log(`WARNING: ${oracleless.map(m => `${m.name} (target ${m.targetBps} bps)`).join(', ')} ` +
+        `have no oracle configured and will be IGNORED — not allocated to, and (if they hold funds) ` +
+        `not deallocated from, so the strategy/migration cannot complete. Set their ORACLE_* env vars.`);
+  }
+
+  // The module-load validateTargetBpsSum check covers ALL markets, but the engine only
+  // operates on the oracle-configured subset. If those targets don't sum to the overall
+  // allocated target, the difference stays idle — quantify the shortfall so the gap the
+  // oracle warning describes is visible as a number, not just a list of markets.
+  const configuredTargetSum = configuredMarkets.reduce((sum, m) => sum + m.targetBps, 0);
+  if (configuredTargetSum !== config.targetAllocatedPercent) {
+    log(`WARNING: oracle-configured markets' targets sum to ${configuredTargetSum} bps, but ` +
+        `targetAllocatedPercent is ${config.targetAllocatedPercent} bps — ` +
+        `${config.targetAllocatedPercent - configuredTargetSum} bps (of totalAssets) will remain unallocated.`);
   }
 
   const marketIds = configuredMarkets.map(m => computeMarketId(m));
@@ -564,11 +638,13 @@ async function main() {
   const targetPerMarketBpsByIndex = configuredMarkets.map(m => m.targetBps);
   const result = computeAllocationActions({
     totalAssets,
-    adapterAssets,
     perMarketAssets,
-    targetAllocatedPercent: config.targetAllocatedPercent,
     targetPerMarketBpsByIndex,
     rebalanceThresholdBps: config.rebalanceThresholdBps,
+    // Sweep retired (target-0) markets down to the dust floor even when their deviation
+    // is below the bps threshold, so leftover funds are returned to the vault rather than
+    // stranded just under the rebalance threshold.
+    minSweepAmount: config.minAllocationAmount,
   });
 
   if (result.skipped) {
@@ -582,37 +658,67 @@ async function main() {
 
   // Fresh reads for allocation markets (all in parallel, single consistent snapshot)
   const freshExpectedByIndex = new Map<number, bigint>();
+  // On-chain relative cap (WAD) per allocate market's collateral, to clamp allocations.
+  const onchainRelativeCapWadByIndex = new Map<number, bigint>();
   let freshTotalAssets = totalAssets;
 
   if (allocateActions.length > 0) {
     const allocateMarketIds = allocateActions.map(a => computeMarketId(configuredMarkets[a.marketIndex]));
-    const [freshTotal, ...freshExpected] = await Promise.all([
+    const allocateCapIds = allocateActions.map(a => computeCollateralCapId(configuredMarkets[a.marketIndex]));
+    const [freshTotal, freshExpected, relativeCaps] = await Promise.all([
       publicClient.readContract({
         address: config.vaultAddress,
         abi: vaultAbi,
         functionName: 'totalAssets',
       }),
-      ...allocateMarketIds.map(id =>
+      Promise.all(allocateMarketIds.map(id =>
         publicClient.readContract({
           address: config.adapterAddress,
           abi: adapterAbi,
           functionName: 'expectedSupplyAssets',
           args: [id],
         }),
-      ),
+      )),
+      Promise.all(allocateCapIds.map(id =>
+        publicClient.readContract({
+          address: config.vaultAddress,
+          abi: vaultAbi,
+          functionName: 'relativeCap',
+          args: [id],
+        }),
+      )),
     ]);
     freshTotalAssets = freshTotal;
-    allocateActions.forEach((a, i) => freshExpectedByIndex.set(a.marketIndex, freshExpected[i]));
+    allocateActions.forEach((a, i) => {
+      freshExpectedByIndex.set(a.marketIndex, freshExpected[i]);
+      onchainRelativeCapWadByIndex.set(a.marketIndex, relativeCaps[i]);
+    });
   }
 
-  // Per-market cap limit (with headroom) — computed in the allocate loop below
-  // since each market may have a different targetBps.
-  const computeEffectiveCap = (marketIndex: number): bigint => {
-    const targetBps = configuredMarkets[marketIndex].targetBps;
-    const capLimit = computeCapLimit(freshTotalAssets, bpsToWad(targetBps));
-    const headroom = capLimit * CAP_HEADROOM_BPS / 10000n;
-    return capLimit - headroom;
-  };
+  // Per-market effective cap (with headroom), computed once and reused below. Each cap is
+  // clamped to the vault's on-chain relative cap: if the cap hasn't been raised to the
+  // target yet, allocating to the full target would revert (RelativeCapExceeded) and,
+  // because the batch is atomic, take the deallocations down with it. Clamping lets the
+  // bot allocate up to whatever cap is currently live and converge as caps are raised.
+  const allocateCapInfo = allocateActions.map(a => {
+    const market = configuredMarkets[a.marketIndex];
+    const targetCapWad = bpsToWad(market.targetBps);
+    const onchainCapWad = onchainRelativeCapWadByIndex.get(a.marketIndex);
+    const capWad = onchainCapWad !== undefined && onchainCapWad < targetCapWad ? onchainCapWad : targetCapWad;
+    const capLimit = computeCapLimit(freshTotalAssets, capWad);
+    const effectiveCap = capLimit - capLimit * CAP_HEADROOM_BPS / 10000n;
+    return { marketIndex: a.marketIndex, market, effectiveCap, capWad, clamped: capWad !== targetCapWad };
+  });
+
+  // Warn when a market's on-chain relative cap is below its target — allocations are
+  // clamped to the live cap, so the market can't reach target until the cap is raised.
+  for (const info of allocateCapInfo) {
+    if (info.clamped) {
+      const onchainBps = Number((info.capWad * 10000n) / 10n ** 18n);
+      log(`WARNING: ${info.market.name} on-chain relative cap is ${onchainBps} bps but target is ${info.market.targetBps} bps — ` +
+          `allocations are clamped to the on-chain cap. Raise the cap (increaseRelativeCap) to reach target.`);
+    }
+  }
 
   // Read available liquidity from Morpho Blue for markets we need to deallocate from.
   // If a market has high utilization (borrows ≈ supply), we can only withdraw
@@ -643,55 +749,83 @@ async function main() {
   // Order matters: deallocations free up idle balance for subsequent allocations
   const vaultCalls: { name: string; action: string; amount: bigint; calldata: Hex }[] = [];
 
-  // Build deallocate calls (capped by liquidity)
-  for (const capped of cappedDeallocations) {
-    const market = configuredMarkets[capped.marketIndex];
+  // Plan deallocations via the pure composition, then map outcomes -> log + on-chain call.
+  // cappedDeallocations is capDeallocationsToLiquidity(deallocateActions), which maps 1:1
+  // in order, so cappedDeallocations[i] corresponds to deallocateActions[i] (the pre-cap
+  // desired amount used for the dust decision).
+  const deallocatePlan: DeallocatePlanItem[] = cappedDeallocations.map((c, i) => ({
+    marketIndex: c.marketIndex,
+    targetBps: configuredMarkets[c.marketIndex].targetBps,
+    desired: deallocateActions[i].amount,
+    cappedAmount: c.amount,
+    capped: c.capped,
+    skipped: c.skipped,
+    availableLiquidity: c.availableLiquidity,
+  }));
 
-    if (capped.skipped) {
-      log(`  ${market.name}: insufficient liquidity (${formatEther(capped.availableLiquidity)} available), skipping deallocate`);
+  for (const outcome of planDeallocations(deallocatePlan, config.minAllocationAmount)) {
+    const market = configuredMarkets[outcome.marketIndex];
+    if (outcome.status === 'skip-liquidity') {
+      log(`  ${market.name}: insufficient liquidity (${formatEther(outcome.availableLiquidity)} available), skipping deallocate`);
       continue;
     }
-    if (capped.capped) {
-      log(`  ${market.name}: capping deallocate to ${formatEther(capped.amount)} (${formatEther(capped.availableLiquidity)} liquidity in pool)`);
+    if (outcome.status === 'skip-dust') {
+      log(`  ${market.name}: deallocate ${formatEther(outcome.desired)} below minimum (${formatEther(config.minAllocationAmount)}, target ${market.targetBps} bps), skipping`);
+      continue;
     }
-
+    if (outcome.capped) {
+      log(`  ${market.name}: capping deallocate to ${formatEther(outcome.amount)} (${formatEther(outcome.availableLiquidity)} liquidity in pool)`);
+    }
     vaultCalls.push({
       name: market.name,
       action: 'deallocate',
-      amount: capped.amount,
+      amount: outcome.amount,
       calldata: encodeFunctionData({
         abi: vaultAbi,
         functionName: 'deallocate',
-        args: [config.adapterAddress, market.encodedParams!, capped.amount],
+        args: [config.adapterAddress, market.encodedParams!, outcome.amount],
       }),
     });
   }
 
-  for (const a of allocateActions) {
-    const market = configuredMarkets[a.marketIndex];
-    const freshExpected = freshExpectedByIndex.get(a.marketIndex)!;
-    const effectiveCap = computeEffectiveCap(a.marketIndex);
-    const execAmount = effectiveCap > freshExpected ? effectiveCap - freshExpected : 0n;
+  // Plan allocations via the pure composition. Routine "at cap" no-ops are silent (they'd
+  // otherwise spam a skip line for every grown market on each sweep run); dust gaps log.
+  const allocatePlan: AllocatePlanItem[] = allocateCapInfo.map(info => ({
+    marketIndex: info.marketIndex,
+    effectiveCap: info.effectiveCap,
+    freshExpected: freshExpectedByIndex.get(info.marketIndex)!,
+  }));
 
-    if (execAmount === 0n) {
-      log(`  ${market.name}: already at cap (${formatEther(freshExpected)} >= ${formatEther(effectiveCap)}, target ${market.targetBps} bps), skipping`);
+  for (const outcome of planAllocations(allocatePlan, config.minAllocationAmount)) {
+    const market = configuredMarkets[outcome.marketIndex];
+    if (outcome.status === 'skip-atcap') {
       continue;
     }
-
+    if (outcome.status === 'skip-dust') {
+      log(`  ${market.name}: allocate ${formatEther(outcome.gap)} below minimum (${formatEther(config.minAllocationAmount)}, target ${market.targetBps} bps), skipping`);
+      continue;
+    }
     vaultCalls.push({
       name: market.name,
       action: 'allocate',
-      amount: execAmount,
+      amount: outcome.amount,
       calldata: encodeFunctionData({
         abi: vaultAbi,
         functionName: 'allocate',
-        args: [config.adapterAddress, market.encodedParams!, execAmount],
+        args: [config.adapterAddress, market.encodedParams!, outcome.amount],
       }),
     });
   }
 
   if (vaultCalls.length === 0) {
-    log('No executable actions (all markets skipped due to liquidity constraints or cap limits)');
+    // Rebalancing WAS triggered (we passed computeAllocationActions' threshold gate) but
+    // every action was dropped by liquidity caps, cap limits, or the dust filter. This is
+    // an anomaly, not a clean "within threshold" no-op: the rebalance/migration may be
+    // BLOCKED (e.g. illiquid markets that can't be drained). Surface it loudly so the
+    // 6-hourly cron doesn't silently spin forever without making progress.
+    log('WARNING: rebalancing was triggered but ALL actions were dropped (liquidity ' +
+        'constraints, cap limits, or dust filter). The rebalance/migration may be BLOCKED — ' +
+        'check market liquidity and oracle configuration.');
     return;
   }
 
@@ -701,12 +835,9 @@ async function main() {
     const direction = call.action === 'allocate' ? 'to' : 'from';
     log(`  ${call.action} ${formatEther(call.amount)} USDS ${direction} ${call.name}`);
   }
-  if (allocateActions.length > 0) {
-    const capSummary = allocateActions
-      .map(a => {
-        const m = configuredMarkets[a.marketIndex];
-        return `${m.name}@${m.targetBps}bps→${formatEther(computeEffectiveCap(a.marketIndex))}`;
-      })
+  if (allocateCapInfo.length > 0) {
+    const capSummary = allocateCapInfo
+      .map(info => `${info.market.name}@${info.market.targetBps}bps→${formatEther(info.effectiveCap)}`)
       .join(', ');
     log(`  (effective caps: ${capSummary})`);
   }

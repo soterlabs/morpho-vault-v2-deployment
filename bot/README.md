@@ -8,11 +8,28 @@ Transactions are executed through a **Safe 1/3 multisig**. The bot is one of the
 
 The bot allocates vault funds according to this strategy:
 - **80% idle** - Kept in the vault for immediate withdrawal liquidity
-- **20% allocated** - Split equally across 4 Morpho Blue markets:
-  - stUSDS/USDS (5%)
-  - cbBTC/USDS (5%)
-  - wstETH/USDS (5%)
-  - WETH/USDS (5%)
+- **20% allocated** - Distributed across 4 Morpho Blue markets. Each market has its
+  own target, configurable via `TARGET_<MARKET>_BPS` env vars (basis points), and
+  defaulting to 500 (5%) each:
+  - stUSDS/USDS (`TARGET_STUSDS_BPS`, default 5%)
+  - cbBTC/USDS (`TARGET_CBBTC_BPS`, default 5%)
+  - wstETH/USDS (`TARGET_WSTETH_BPS`, default 5%)
+  - WETH/USDS (`TARGET_WETH_BPS`, default 5%)
+
+  The sum of per-market targets must equal the 20% allocated target; the bot throws on
+  startup if they don't. Asymmetric targets let the bot drive migrations — e.g.
+  `TARGET_STUSDS_BPS=0 TARGET_CBBTC_BPS=1000 TARGET_WSTETH_BPS=1000 TARGET_WETH_BPS=0`
+  drives stUSDS/WETH **toward** 0% and cbBTC/wstETH **toward** 10% each over successive
+  runs. The bot rebalances only while a market's deviation exceeds `rebalanceThresholdBps`
+  (0.1%) and skips per-action amounts below `minAllocationAmount`, so *grown* markets
+  converge to within ~0.1% of target rather than landing on it exactly. **Retired
+  (target-0) markets are an exception: they are swept.** A retired market still holding
+  at least `minAllocationAmount` forces a rebalance even when its deviation is under the
+  0.1% threshold, and the resulting deallocation is exempt from the dust filter, so its
+  residual is returned to the vault down to genuine dust (< `minAllocationAmount`) rather
+  than being stranded just under the threshold. Each market that is allocated to or
+  drained **must also have its `ORACLE_*` env var set** — a market with no oracle is
+  ignored entirely (the bot warns at startup if so).
 
 ## Prerequisites
 
@@ -78,13 +95,13 @@ DRY_RUN=true npm run dev
 
 ### Cronjob Setup
 
-Run every hour to maintain allocation:
+Run every 6 hours to maintain allocation:
 ```bash
 # Edit crontab
 crontab -e
 
 # Add this line (adjust paths as needed)
-0 * * * * cd /path/to/morpho-vault-v2-deployment/bot && /usr/bin/npm run allocate >> /var/log/vault-allocator.log 2>&1
+0 */6 * * * cd /path/to/morpho-vault-v2-deployment/bot && /usr/bin/npm run allocate >> /var/log/vault-allocator.log 2>&1
 ```
 
 ## How It Works
@@ -92,11 +109,10 @@ crontab -e
 1. **Verify Safe setup** — Confirms bot is a Safe owner and threshold is 1
 2. **Check permissions** — Verifies the Safe is an allocator on the vault
 3. **Read current state** — Gets total assets, adapter total, idle balance
-4. **Early threshold check** — If total deviation < 0.1%, skip (avoids unnecessary RPC calls)
-5. **Read per-market balances** — Calls `adapter.expectedSupplyAssets(marketId)` for each market
-6. **Compute per-market actions** — Only allocate/deallocate markets that are off-target
-7. **Check market liquidity** — For deallocations, reads Morpho Blue market state and caps amounts to available liquidity (minus 5% reserve)
-8. **Execute via Safe** — Signs and executes through the Safe multisig with a 50% gas buffer
+4. **Read per-market balances** — Calls `adapter.expectedSupplyAssets(marketId)` for each market
+5. **Compute per-market actions** — Only allocate/deallocate markets that are off-target. Skips (no transaction) only when *every* market's deviation from its own target is below the threshold — so asymmetric migrations still fire even when the aggregate allocated total already matches target
+6. **Check market liquidity** — For deallocations, reads Morpho Blue market state and caps amounts to available liquidity (minus 5% reserve)
+7. **Execute via Safe** — Signs and executes through the Safe multisig with a 50% gas buffer
 8. **Log results** — Reports final state
 
 ## Allocation Logic
@@ -118,7 +134,7 @@ After:  [5%, 5%, 5%, 5%]  (20% total)
 ```
 
 ### Case 3: All markets at target
-Total deviation is below the 0.1% threshold. No actions taken.
+Every market's deviation from its own target is below the 0.1% threshold. No actions taken.
 ```
 Before: [5%, 5%, 5%, 5%]  → No actions
 ```
@@ -140,7 +156,16 @@ After:  [5%, 5%, 5%, 5%]  (20% total)
 ```
 
 ### Case 6: Interest accrual
-Markets accrue interest over time, causing small deviations. As long as the total deviation stays below 0.1%, no rebalancing is triggered.
+Markets accrue interest over time, causing small deviations. As long as every market's deviation from its target stays below 0.1%, no rebalancing is triggered.
+
+### Case 7: Dust sweep of a retired market
+A market with target 0 that still holds a residual is swept back to the vault even when that residual is below the 0.1% rebalance threshold — as long as it's at least `minAllocationAmount`. This keeps a retired market from getting stuck holding up to ~0.1% of totalAssets that the normal threshold would otherwise ignore.
+```
+Targets: [0%, 10%, 10%, 0%]
+Before:  [0.05%, 10%, 10%, 0%]  (stUSDS holds 0.05% — under the 0.1% threshold but ≥ minAllocationAmount)
+         → Action: deallocate stUSDS's residual to the vault
+After:   [~0%, 10%, 10%, 0%]    (drained to < minAllocationAmount dust)
+```
 
 ### Fresh state reads + headroom (1 bps)
 The vault's relative cap check uses `mulDivDown(totalAssets, relativeCap, WAD)` to compute the maximum allowed allocation. Interest accrues between the bot's RPC read and tx execution, which can cause the adapter's `expectedSupplyAssets` to overshoot the cap.
@@ -173,9 +198,10 @@ Runs unit tests for the allocation logic covering all cases above, including the
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `targetIdlePercent` | 80% | Target idle percentage |
-| `targetPerMarketPercent` | 5% | Target per market |
-| `rebalanceThresholdBps` | 0.1% | Min deviation to trigger rebalance |
-| `minAllocationAmount` | 100 USDS | Min amount to allocate (avoids dust) |
+| `targetAllocatedPercent` | 20% | Total allocated target (must equal the sum of per-market targets) |
+| `TARGET_<MARKET>_BPS` | 500 (5%) | Per-market target in basis points (env-overridable, see Strategy) |
+| `rebalanceThresholdBps` | 0.1% | Min per-market deviation to trigger rebalance |
+| `minAllocationAmount` | 100 USDS | Min per-action amount to allocate/deallocate (suppresses dust transactions) |
 
 ## Security Notes
 
@@ -191,14 +217,16 @@ To implement price-based dynamic allocation:
 
 1. Add Chainlink price feed reads
 2. Calculate weights based on price/volatility
-3. Adjust `targetPerMarket` per asset
-4. Ensure total still respects 20% cap
+3. Set each market's `targetBps` from those weights
+4. Ensure the per-market targets still sum to the 20% allocated cap
 
 Example modification point in `allocator.ts`:
 ```typescript
-// Replace fixed weights with dynamic calculation
+// Replace fixed per-market targetBps with dynamic calculation
 const weights = await calculateDynamicWeights(publicClient);
-const targetPerMarket = (targetTotalAllocated * weights[market.name]) / 10000n;
+for (const market of markets) {
+  market.targetBps = weights[market.name]; // basis points; must sum to targetAllocatedPercent
+}
 ```
 
 ## Troubleshooting

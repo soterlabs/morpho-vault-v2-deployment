@@ -1,14 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, type AllocationInput, type AllocationAction, type MarketLiquidity } from './allocation-logic.js';
+import { computeAllocationActions, computeCapLimit, bpsToWad, CAP_HEADROOM_BPS, capDeallocationsToLiquidity, LIQUIDITY_RESERVE_PERCENT, parseTargetBps, validateTargetBpsSum, shouldExecuteDeallocate, planDeallocations, planAllocations, type AllocationInput, type AllocationAction, type MarketLiquidity, type DeallocatePlanItem, type AllocatePlanItem } from './allocation-logic.js';
 import { parseEther } from 'viem';
 
 // Helper: build an AllocationInput with sensible defaults (4 markets, 80/20 split, 5% each).
 // targetPerMarketBpsByIndex defaults to [500, 500, 500, 500] sized to perMarketAssets.length
 // so most tests don't have to repeat it. Override per test if asymmetric targets are needed.
-function input(overrides: Partial<AllocationInput> & Pick<AllocationInput, 'totalAssets' | 'adapterAssets' | 'perMarketAssets'>): AllocationInput {
+function input(overrides: Partial<AllocationInput> & Pick<AllocationInput, 'totalAssets' | 'perMarketAssets'>): AllocationInput {
   const numMarkets = overrides.perMarketAssets.length;
   return {
-    targetAllocatedPercent: 2000,  // 20%
     targetPerMarketBpsByIndex: new Array(numMarkets).fill(500),  // 5% each by default
     rebalanceThresholdBps: 100,    // 1%
     ...overrides,
@@ -99,7 +98,6 @@ describe('computeAllocationActions', () => {
     it('allocates equally to all 4 markets', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: 0n,
         perMarketAssets: [0n, 0n, 0n, 0n],
       }));
 
@@ -115,7 +113,6 @@ describe('computeAllocationActions', () => {
     it('produces correct market indices', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: 0n,
         perMarketAssets: [0n, 0n, 0n, 0n],
       }));
 
@@ -133,7 +130,6 @@ describe('computeAllocationActions', () => {
       // stUSDS and wstETH at 5% already, cbBTC and WETH at 0%
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('100'),  // 10% total
         perMarketAssets: [eth('50'), 0n, eth('50'), 0n],
       }));
 
@@ -149,7 +145,6 @@ describe('computeAllocationActions', () => {
       // cbBTC and WETH at 2.5% (half target), rest at target
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('150'),  // 15%
         perMarketAssets: [eth('50'), eth('25'), eth('50'), eth('25')],
       }));
 
@@ -167,7 +162,6 @@ describe('computeAllocationActions', () => {
     it('skips when perfectly balanced', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('200'),  // 20%
         perMarketAssets: [eth('50'), eth('50'), eth('50'), eth('50')],
       }));
 
@@ -185,7 +179,6 @@ describe('computeAllocationActions', () => {
       // 19.5% allocated (0.5% deviation < 1% threshold)
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('195'),
         perMarketAssets: [eth('50'), eth('50'), eth('50'), eth('45')],
       }));
 
@@ -197,7 +190,6 @@ describe('computeAllocationActions', () => {
       // 19% allocated (1% deviation = threshold, triggers rebalance)
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('190'),
         perMarketAssets: [eth('50'), eth('50'), eth('50'), eth('40')],
       }));
 
@@ -211,7 +203,6 @@ describe('computeAllocationActions', () => {
       // 18% allocated (2% deviation > 1% threshold)
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('180'),
         perMarketAssets: [eth('50'), eth('50'), eth('50'), eth('30')],
       }));
 
@@ -229,7 +220,6 @@ describe('computeAllocationActions', () => {
       // 30% total allocated, target 20%
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('300'),
         perMarketAssets: [eth('75'), eth('75'), eth('75'), eth('75')],
       }));
 
@@ -249,7 +239,6 @@ describe('computeAllocationActions', () => {
       // Total 18% (2% under), but distribution is uneven
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('180'),
         perMarketAssets: [eth('80'), eth('10'), eth('80'), eth('10')],
       }));
 
@@ -274,7 +263,6 @@ describe('computeAllocationActions', () => {
     it('allocates 5% per market', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1'),
-        adapterAssets: 0n,
         perMarketAssets: [0n, 0n, 0n, 0n],
       }));
 
@@ -290,7 +278,6 @@ describe('computeAllocationActions', () => {
       // After first run: stUSDS and wstETH at 5%, cbBTC and WETH at 0%
       const result = computeAllocationActions(input({
         totalAssets: eth('1'),
-        adapterAssets: eth('0.1'),  // 10%
         perMarketAssets: [eth('0.05'), 0n, eth('0.05'), 0n],
       }));
 
@@ -310,7 +297,6 @@ describe('computeAllocationActions', () => {
     it('skips when all 4 markets are at 5%', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1'),
-        adapterAssets: eth('0.2'),  // 20%
         perMarketAssets: [eth('0.05'), eth('0.05'), eth('0.05'), eth('0.05')],
       }));
 
@@ -329,9 +315,7 @@ describe('computeAllocationActions', () => {
     it('returns the raw deficit as allocation amount', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: 0n,
         perMarketAssets: [0n],
-        targetAllocatedPercent: 500,
         targetPerMarketBpsByIndex: [500],
       }));
 
@@ -342,9 +326,7 @@ describe('computeAllocationActions', () => {
     it('deallocate amounts are exact (no cap check needed)', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('300'),
         perMarketAssets: [eth('75')],
-        targetAllocatedPercent: 500,
         targetPerMarketBpsByIndex: [500],
       }));
 
@@ -361,7 +343,6 @@ describe('computeAllocationActions', () => {
       // Starting from the 5/5/5/5 = 20% state, migrate to 0/10/10/0 = 20% state
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('200'),
         perMarketAssets: [eth('50'), eth('50'), eth('50'), eth('50')],
         targetPerMarketBpsByIndex: [0, 1000, 1000, 0],  // 0%, 10%, 10%, 0%
       }));
@@ -383,7 +364,6 @@ describe('computeAllocationActions', () => {
       // Mid-migration: retired markets still have some allocation, cbBTC/wstETH already at 10%
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('220'),
         perMarketAssets: [eth('10'), eth('100'), eth('100'), eth('10')],
         targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
       }));
@@ -397,7 +377,6 @@ describe('computeAllocationActions', () => {
     it('emits no actions when all 4 markets match asymmetric targets exactly', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('200'),
         perMarketAssets: [0n, eth('100'), eth('100'), 0n],
         targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
       }));
@@ -410,9 +389,166 @@ describe('computeAllocationActions', () => {
       // stUSDS has 0.5 USDS dust (0.05% of 1000) — total deviation is 0.05%, below 1% threshold
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: eth('200.5'),
         perMarketAssets: [eth('0.5'), eth('100'), eth('100'), 0n],
         targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+      }));
+
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toBe('within threshold');
+    });
+
+    // The production config uses rebalanceThresholdBps = 10 (0.1%), not the helper's
+    // default of 100 (1%). Pin the migration decision to the real threshold so the
+    // now-critical short-circuit is validated at the value the bot actually runs with.
+    it('fires the full migration at the production threshold (10 bps)', () => {
+      const result = computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        perMarketAssets: [eth('50'), eth('50'), eth('50'), eth('50')],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,  // production value
+      }));
+
+      expect(result.skipped).toBe(false);
+      expect(result.actions).toEqual([
+        { marketIndex: 0, action: 'deallocate', amount: eth('50') },
+        { marketIndex: 1, action: 'allocate', amount: eth('50') },
+        { marketIndex: 2, action: 'allocate', amount: eth('50') },
+        { marketIndex: 3, action: 'deallocate', amount: eth('50') },
+      ]);
+    });
+
+    it('at 10 bps, a sub-threshold dust market alone is skipped but rides along when another market triggers', () => {
+      // Dust-only: stUSDS 0.5 USDS = 5 bps of 1000, below the 10 bps production threshold → skip.
+      const dustOnly = computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        perMarketAssets: [eth('0.5'), eth('100'), eth('100'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,
+      }));
+      expect(dustOnly.skipped).toBe(true);
+
+      // Same dust, but cbBTC is now far off target (50 bps) → the run fires AND the
+      // 0.5 USDS deallocate from the target-0 market rides along. computeAllocationActions
+      // emits it, and because stUSDS is a drain-to-zero market the bot does NOT dust-filter
+      // it on-chain (shouldExecuteDeallocate exempts target=0), so it fully drains.
+      const ridesAlong = computeAllocationActions(input({
+        totalAssets: eth('1000'),
+        perMarketAssets: [eth('0.5'), eth('95'), eth('100'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,
+      }));
+      expect(ridesAlong.skipped).toBe(false);
+      expect(ridesAlong.actions).toEqual([
+        { marketIndex: 0, action: 'deallocate', amount: eth('0.5') },
+        { marketIndex: 1, action: 'allocate', amount: eth('5') },
+      ]);
+    });
+
+    // ----- Dust sweep of retired (target-0) markets (minSweepAmount) -----
+    // Vault of 100,000 so the 10 bps threshold maps to a clean 100 USDS boundary.
+
+    it('sweeps a retired market holding residual above the sweep floor but below the bps threshold', () => {
+      // stUSDS retired (target 0) holds 50 USDS = 5 bps of 100,000, below the 10 bps
+      // threshold; grown markets are exactly at target (10% = 10,000 each). Without a
+      // sweep floor this run would skip and strand the 50 USDS; minSweepAmount=10 fires it.
+      const result = computeAllocationActions(input({
+        totalAssets: eth('100000'),
+        perMarketAssets: [eth('50'), eth('10000'), eth('10000'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,
+        minSweepAmount: eth('10'),
+      }));
+
+      expect(result.skipped).toBe(false);
+      expect(result.actions).toEqual([
+        { marketIndex: 0, action: 'deallocate', amount: eth('50') },
+      ]);
+    });
+
+    it('does NOT sweep when the retired market residual is below the sweep floor', () => {
+      // 5 USDS residual, sweep floor 10 USDS, all else at target → genuine dust, left alone.
+      const result = computeAllocationActions(input({
+        totalAssets: eth('100000'),
+        perMarketAssets: [eth('5'), eth('10000'), eth('10000'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,
+        minSweepAmount: eth('10'),
+      }));
+
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toBe('within threshold');
+    });
+
+    it('sweeps both retired markets when both hold sub-threshold residual', () => {
+      // stUSDS and WETH both retired and holding 50 USDS each (5 bps), grown markets at target.
+      const result = computeAllocationActions(input({
+        totalAssets: eth('100000'),
+        perMarketAssets: [eth('50'), eth('10000'), eth('10000'), eth('50')],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,
+        minSweepAmount: eth('10'),
+      }));
+
+      expect(result.skipped).toBe(false);
+      expect(result.actions).toEqual([
+        { marketIndex: 0, action: 'deallocate', amount: eth('50') },
+        { marketIndex: 3, action: 'deallocate', amount: eth('50') },
+      ]);
+    });
+
+    it('sweep is disabled by default (minSweepAmount omitted → sub-threshold residual is left)', () => {
+      // Same 50 USDS dust as the sweep test, but no minSweepAmount → behaves as before (skips).
+      const result = computeAllocationActions(input({
+        totalAssets: eth('100000'),
+        perMarketAssets: [eth('50'), eth('10000'), eth('10000'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,
+      }));
+
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toBe('within threshold');
+    });
+
+    it('sweep floor does not force a run for a sub-threshold market with a positive target', () => {
+      // cbBTC is 50 USDS below its 10% target (5 bps, within threshold) — not retired,
+      // so the sweep floor must not apply to it; with no other trigger the run skips.
+      const result = computeAllocationActions(input({
+        totalAssets: eth('100000'),
+        perMarketAssets: [0n, eth('9950'), eth('10000'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,
+        minSweepAmount: eth('10'),
+      }));
+
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toBe('within threshold');
+    });
+
+    it('sweeps at the PRODUCTION floor (100 USDS) on a large vault, sub-threshold band', () => {
+      // 20M vault, production threshold 10 bps = 20,000 USDS, production sweep floor 100 USDS.
+      // A retired market holding 5,000 USDS is below threshold (2.5 bps) but well above the
+      // 100 USDS floor → must be swept. Exercises the real production numbers, not eth('10').
+      const result = computeAllocationActions(input({
+        totalAssets: eth('20000000'),
+        perMarketAssets: [eth('5000'), eth('2000000'), eth('2000000'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,
+        minSweepAmount: eth('100'),
+      }));
+
+      expect(result.skipped).toBe(false);
+      expect(result.actions).toEqual([
+        { marketIndex: 0, action: 'deallocate', amount: eth('5000') },
+      ]);
+    });
+
+    it('at the production floor, a residual below 100 USDS is left as dust', () => {
+      const result = computeAllocationActions(input({
+        totalAssets: eth('20000000'),
+        perMarketAssets: [eth('50'), eth('2000000'), eth('2000000'), 0n],
+        targetPerMarketBpsByIndex: [0, 1000, 1000, 0],
+        rebalanceThresholdBps: 10,
+        minSweepAmount: eth('100'),
       }));
 
       expect(result.skipped).toBe(true);
@@ -427,7 +563,6 @@ describe('computeAllocationActions', () => {
     it('handles zero totalAssets', () => {
       const result = computeAllocationActions(input({
         totalAssets: 0n,
-        adapterAssets: 0n,
         perMarketAssets: [0n, 0n, 0n, 0n],
       }));
 
@@ -438,9 +573,7 @@ describe('computeAllocationActions', () => {
     it('handles single market', () => {
       const result = computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: 0n,
         perMarketAssets: [0n],
-        targetAllocatedPercent: 500,
         targetPerMarketBpsByIndex: [500],
       }));
 
@@ -452,7 +585,6 @@ describe('computeAllocationActions', () => {
     it('throws when targetPerMarketBpsByIndex length does not match perMarketAssets', () => {
       expect(() => computeAllocationActions(input({
         totalAssets: eth('1000'),
-        adapterAssets: 0n,
         perMarketAssets: [0n, 0n, 0n, 0n],
         targetPerMarketBpsByIndex: [500, 500],  // 2 targets for 4 markets — should throw
       }))).toThrow(/targetPerMarketBpsByIndex length \(2\) must match perMarketAssets length \(4\)/);
@@ -462,7 +594,6 @@ describe('computeAllocationActions', () => {
       // After interest accrual, markets may be slightly above 5%
       const result = computeAllocationActions(input({
         totalAssets: eth('1000.5'),
-        adapterAssets: eth('200.5'),  // ~20.04%
         perMarketAssets: [
           eth('50.2'),  // slightly above due to interest
           eth('50.1'),
@@ -744,5 +875,183 @@ describe('capDeallocationsToLiquidity', () => {
       const reserve = totalSupply * LIQUIDITY_RESERVE_PERCENT / 100n;
       expect(reserve).toBe(eth('130000'));
     });
+  });
+});
+
+// ============================================================
+// parseTargetBps — env-value parsing for per-market targets
+// ============================================================
+describe('parseTargetBps', () => {
+  it('returns the default only when the value is unset (undefined)', () => {
+    expect(parseTargetBps(undefined, 500, 'TARGET_X_BPS')).toBe(500);
+  });
+
+  it('parses a valid whole number of basis points', () => {
+    expect(parseTargetBps('0', 500, 'TARGET_X_BPS')).toBe(0);
+    expect(parseTargetBps('1000', 500, 'TARGET_X_BPS')).toBe(1000);
+    expect(parseTargetBps('10000', 500, 'TARGET_X_BPS')).toBe(10000);
+  });
+
+  it('tolerates surrounding whitespace around a valid value', () => {
+    expect(parseTargetBps('  1000  ', 500, 'TARGET_X_BPS')).toBe(1000);
+  });
+
+  it('throws on empty string instead of silently coercing to 0', () => {
+    expect(() => parseTargetBps('', 500, 'TARGET_X_BPS')).toThrow(/TARGET_X_BPS/);
+  });
+
+  it('throws on whitespace-only string', () => {
+    expect(() => parseTargetBps('   ', 500, 'TARGET_X_BPS')).toThrow(/TARGET_X_BPS/);
+  });
+
+  it('throws on non-numeric values', () => {
+    expect(() => parseTargetBps('abc', 500, 'TARGET_X_BPS')).toThrow();
+  });
+
+  it('throws on negative values', () => {
+    expect(() => parseTargetBps('-100', 500, 'TARGET_X_BPS')).toThrow();
+  });
+
+  it('throws on decimals', () => {
+    expect(() => parseTargetBps('5.5', 500, 'TARGET_X_BPS')).toThrow();
+  });
+
+  it('throws on non-decimal forms (hex, exponential)', () => {
+    expect(() => parseTargetBps('0x10', 500, 'TARGET_X_BPS')).toThrow();
+    expect(() => parseTargetBps('1e3', 500, 'TARGET_X_BPS')).toThrow();
+  });
+
+  it('throws when above 10000 bps (100%)', () => {
+    expect(() => parseTargetBps('10001', 500, 'TARGET_X_BPS')).toThrow(/<= 10000/);
+  });
+});
+
+// ============================================================
+// validateTargetBpsSum — strategy invariant enforcement
+// ============================================================
+describe('validateTargetBpsSum', () => {
+  it('passes when targets sum to the expected total (legacy 5/5/5/5)', () => {
+    expect(() => validateTargetBpsSum(
+      [{ label: 'a', bps: 500 }, { label: 'b', bps: 500 }, { label: 'c', bps: 500 }, { label: 'd', bps: 500 }],
+      2000,
+    )).not.toThrow();
+  });
+
+  it('passes for the asymmetric migration targets (0/10/10/0)', () => {
+    expect(() => validateTargetBpsSum(
+      [{ label: 'stUSDS', bps: 0 }, { label: 'cbBTC', bps: 1000 }, { label: 'wstETH', bps: 1000 }, { label: 'WETH', bps: 0 }],
+      2000,
+    )).not.toThrow();
+  });
+
+  it('throws when the sum is below target (e.g. a forgotten override)', () => {
+    expect(() => validateTargetBpsSum(
+      [{ label: 'stUSDS', bps: 0 }, { label: 'cbBTC', bps: 1000 }, { label: 'wstETH', bps: 500 }, { label: 'WETH', bps: 0 }],
+      2000,
+    )).toThrow(/1500.*must equal.*2000/);
+  });
+
+  it('throws when the sum is above target', () => {
+    expect(() => validateTargetBpsSum(
+      [{ label: 'a', bps: 1000 }, { label: 'b', bps: 1000 }, { label: 'c', bps: 1000 }],
+      2000,
+    )).toThrow(/3000.*must equal.*2000/);
+  });
+});
+
+// ============================================================
+// shouldExecuteDeallocate — dust filter that never blocks drain-to-zero
+// ============================================================
+describe('shouldExecuteDeallocate', () => {
+  const MIN = eth('100');
+
+  it('always executes for a drain-to-zero market (target 0), even sub-floor', () => {
+    // The migration's whole point: a retiring market must fully empty, not strand dust.
+    expect(shouldExecuteDeallocate(eth('50'), 0, MIN)).toBe(true);
+    expect(shouldExecuteDeallocate(1n, 0, MIN)).toBe(true);
+  });
+
+  it('judges non-zero-target trims by the desired amount vs the floor', () => {
+    expect(shouldExecuteDeallocate(eth('500'), 500, MIN)).toBe(true);   // real trim
+    expect(shouldExecuteDeallocate(eth('50'), 500, MIN)).toBe(false);   // dust trim → skip
+    expect(shouldExecuteDeallocate(eth('100'), 500, MIN)).toBe(true);   // exactly at floor
+  });
+
+  it('drain-to-zero exemption is independent of the (pre-cap) desired amount', () => {
+    // Even a large desired drain that liquidity would cap small still passes here,
+    // because the dust decision is made on the desired amount and target=0 is exempt.
+    expect(shouldExecuteDeallocate(eth('100000'), 0, MIN)).toBe(true);
+  });
+});
+
+// ============================================================
+// planDeallocations — composition of liquidity skip + dust filter
+// ============================================================
+describe('planDeallocations', () => {
+  const MIN = eth('100');
+  const item = (o: Partial<DeallocatePlanItem> & Pick<DeallocatePlanItem, 'marketIndex' | 'targetBps' | 'desired' | 'cappedAmount'>): DeallocatePlanItem => ({
+    capped: false, skipped: false, availableLiquidity: eth('1000000'), ...o,
+  });
+
+  it('executes a normal drain', () => {
+    const out = planDeallocations([item({ marketIndex: 0, targetBps: 0, desired: eth('500'), cappedAmount: eth('500') })], MIN);
+    expect(out).toEqual([{ marketIndex: 0, status: 'execute', amount: eth('500'), capped: false, availableLiquidity: eth('1000000') }]);
+  });
+
+  it('skips liquidity-starved markets', () => {
+    const out = planDeallocations([item({ marketIndex: 1, targetBps: 0, desired: eth('500'), cappedAmount: 0n, skipped: true, availableLiquidity: 0n })], MIN);
+    expect(out[0].status).toBe('skip-liquidity');
+  });
+
+  it('liquidity-limited drain of a retired market still executes the capped slice (not dropped as dust)', () => {
+    // The key regression guard: desired 500 (≥ floor and target-0), liquidity caps to 50.
+    // Dust decision is on `desired` (500), not the capped 50, so it executes incremental progress.
+    const out = planDeallocations([item({ marketIndex: 3, targetBps: 0, desired: eth('500'), cappedAmount: eth('50'), capped: true, availableLiquidity: eth('50') })], MIN);
+    expect(out).toEqual([{ marketIndex: 3, status: 'execute', amount: eth('50'), capped: true, availableLiquidity: eth('50') }]);
+  });
+
+  it('drain-to-zero executes even when the full residual is below the floor', () => {
+    const out = planDeallocations([item({ marketIndex: 0, targetBps: 0, desired: eth('5'), cappedAmount: eth('5') })], MIN);
+    expect(out[0]).toMatchObject({ status: 'execute', amount: eth('5') });
+  });
+
+  it('suppresses a sub-floor trim on a non-retired market', () => {
+    const out = planDeallocations([item({ marketIndex: 1, targetBps: 500, desired: eth('50'), cappedAmount: eth('50') })], MIN);
+    expect(out[0]).toEqual({ marketIndex: 1, status: 'skip-dust', desired: eth('50') });
+  });
+
+  it('preserves order across mixed outcomes', () => {
+    const out = planDeallocations([
+      item({ marketIndex: 0, targetBps: 0, desired: eth('500'), cappedAmount: eth('500') }),
+      item({ marketIndex: 1, targetBps: 500, desired: eth('50'), cappedAmount: eth('50') }),
+      item({ marketIndex: 3, targetBps: 0, desired: eth('300'), cappedAmount: 0n, skipped: true, availableLiquidity: 0n }),
+    ], MIN);
+    expect(out.map(o => o.status)).toEqual(['execute', 'skip-dust', 'skip-liquidity']);
+  });
+});
+
+// ============================================================
+// planAllocations — gap-to-cap with dust floor and at-cap distinction
+// ============================================================
+describe('planAllocations', () => {
+  const MIN = eth('100');
+  const item = (marketIndex: number, effectiveCap: bigint, freshExpected: bigint): AllocatePlanItem => ({ marketIndex, effectiveCap, freshExpected });
+
+  it('executes the gap to the effective cap when above the floor', () => {
+    expect(planAllocations([item(1, eth('1400'), eth('1000'))], MIN)).toEqual([{ marketIndex: 1, status: 'execute', amount: eth('400') }]);
+  });
+
+  it('marks already-at-cap as skip-atcap (routine, silent)', () => {
+    expect(planAllocations([item(1, eth('1400'), eth('1400'))], MIN)).toEqual([{ marketIndex: 1, status: 'skip-atcap' }]);
+    expect(planAllocations([item(1, eth('1400'), eth('1500'))], MIN)).toEqual([{ marketIndex: 1, status: 'skip-atcap' }]);
+  });
+
+  it('marks a sub-floor gap as skip-dust (worth logging)', () => {
+    expect(planAllocations([item(2, eth('1400'), eth('1350'))], MIN)).toEqual([{ marketIndex: 2, status: 'skip-dust', gap: eth('50') }]);
+  });
+
+  it('a grown market sitting 1 bps under cap (headroom) is skip-atcap, not a dust log', () => {
+    // effectiveCap == freshExpected (market already at the clamped cap) → routine no-op.
+    expect(planAllocations([item(1, eth('2000000'), eth('2000000'))], MIN)).toEqual([{ marketIndex: 1, status: 'skip-atcap' }]);
   });
 });
