@@ -16,9 +16,10 @@ export const CAP_HEADROOM_BPS = 1n;
 /**
  * Percentage of pool supply reserved as a liquidity cushion when deallocating.
  * Prevents the bot from pushing market utilization too high.
- * 5% means we leave at least 5% of the pool's totalSupply as idle liquidity.
+ * Default 5% means we leave at least 5% of the pool's totalSupply as idle liquidity.
+ * Override via env var LIQUIDITY_RESERVE_PERCENT (integer, e.g. "0" to disable cushion).
  */
-export const LIQUIDITY_RESERVE_PERCENT = 5n;
+export const LIQUIDITY_RESERVE_PERCENT = BigInt(process.env.LIQUIDITY_RESERVE_PERCENT ?? '5');
 
 export interface AllocationAction {
   marketIndex: number;
