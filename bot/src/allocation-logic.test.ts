@@ -866,7 +866,8 @@ describe('capDeallocationsToLiquidity', () => {
   });
 
   describe('reserve constant', () => {
-    it('LIQUIDITY_RESERVE_PERCENT is 5', () => {
+    it('LIQUIDITY_RESERVE_PERCENT defaults to 5 (override via env)', () => {
+      // Default when env var is unset (vitest runs without LIQUIDITY_RESERVE_PERCENT set)
       expect(LIQUIDITY_RESERVE_PERCENT).toBe(5n);
     });
 
